@@ -132,6 +132,8 @@ npm run dev
 - Frontend: `http://localhost:3000`
 - Backend API: `http://localhost:5001`
 
+Ports already in use? Set `FRONTEND_PORT` and/or `FLASK_PORT` in `.env` — the dev server, its `/api` proxy, and docker-compose all follow them.
+
 Start individually:
 
 ```bash
