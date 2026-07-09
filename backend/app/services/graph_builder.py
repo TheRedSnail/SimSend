@@ -355,18 +355,20 @@ class GraphBuilderService:
         if not episode_uuids:
             if progress_callback:
                 progress_callback("No waiting needed (no episodes)", 1.0)
-            return
-        
+            return True
+
         start_time = time.time()
         pending_episodes = set(episode_uuids)
         completed_count = 0
         total_episodes = len(episode_uuids)
+        timed_out = False
         
         if progress_callback:
             progress_callback(f"Waiting for {total_episodes} text chunks to process...", 0)
         
         while pending_episodes:
             if time.time() - start_time > timeout:
+                timed_out = True
                 if progress_callback:
                     progress_callback(
                         f"Some text chunks timed out, completed {completed_count}/{total_episodes}",
