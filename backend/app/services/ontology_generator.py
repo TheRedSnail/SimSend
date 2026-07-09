@@ -5,10 +5,32 @@ Interface 1: Analyze text content to generate entity and relationship type defin
 
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 from ..utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+def _split_words(name: str) -> List[str]:
+    """Split a name into words on non-alphanumeric chars and camelCase boundaries."""
+    parts = re.split(r'[^a-zA-Z0-9]+', name)
+    words = []
+    for part in parts:
+        words.extend(re.sub(r'([a-z])([A-Z])', r'\1_\2', part).split('_'))
+    return [w for w in words if w]
+
+
+def _to_pascal_case(name: str) -> str:
+    """Convert any naming style to PascalCase ('works_for' -> 'WorksFor', 'person' -> 'Person')."""
+    result = ''.join(word.capitalize() for word in _split_words(name))
+    return result if result else 'Unknown'
+
+
+def _to_screaming_snake_case(name: str) -> str:
+    """Convert any naming style to UPPER_SNAKE_CASE ('buys from' -> 'BUYS_FROM')."""
+    result = '_'.join(word.upper() for word in _split_words(name))
+    return result if result else 'UNKNOWN'
 
 
 # System prompt for ontology generation
@@ -268,7 +290,17 @@ Based on the above content, design entity types and relationship types suitable 
             result["analysis_summary"] = ""
 
         # Validate entity types
+        # Map original names to PascalCase so edge source_targets references can
+        # be fixed up to match after conversion.
+        entity_name_map = {}
         for entity in result["entity_types"]:
+            # Force entity names to PascalCase (Zep API requirement)
+            if "name" in entity:
+                original_name = entity["name"]
+                entity["name"] = _to_pascal_case(original_name)
+                if entity["name"] != original_name:
+                    logger.warning(f"Entity type name '{original_name}' auto-converted to '{entity['name']}'")
+                entity_name_map[original_name] = entity["name"]
             if "attributes" not in entity:
                 entity["attributes"] = []
             if "examples" not in entity:
@@ -281,6 +313,18 @@ Based on the above content, design entity types and relationship types suitable 
         # Zep API limit: each edge can have at most 10 source_targets pairs.
         MAX_SOURCE_TARGETS_PER_EDGE = 10
         for edge in result["edge_types"]:
+            # Force edge names to UPPER_SNAKE_CASE (Zep API requirement)
+            if "name" in edge:
+                original_name = edge["name"]
+                edge["name"] = _to_screaming_snake_case(original_name)
+                if edge["name"] != original_name:
+                    logger.warning(f"Edge type name '{original_name}' auto-converted to '{edge['name']}'")
+            # Fix source_targets entity references to match converted PascalCase names
+            for st in edge.get("source_targets", []):
+                if st.get("source") in entity_name_map:
+                    st["source"] = entity_name_map[st["source"]]
+                if st.get("target") in entity_name_map:
+                    st["target"] = entity_name_map[st["target"]]
             if "source_targets" not in edge:
                 edge["source_targets"] = []
             if "attributes" not in edge:
@@ -298,6 +342,19 @@ Based on the above content, design entity types and relationship types suitable 
         # Zep API limit: max 10 custom entity types, max 10 custom edge types
         MAX_ENTITY_TYPES = 10
         MAX_EDGE_TYPES = 10
+
+        # Deduplicate entity types by name (case conversion can create collisions),
+        # keeping the first occurrence.
+        seen_names = set()
+        deduped = []
+        for entity in result["entity_types"]:
+            name = entity.get("name", "")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                deduped.append(entity)
+            elif name in seen_names:
+                logger.warning(f"Duplicate entity type '{name}' removed during validation")
+        result["entity_types"] = deduped
 
         # Fallback type definitions
         person_fallback = {
