@@ -6,7 +6,7 @@ Unified OpenAI-compatible API calls
 import json
 import re
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from openai import OpenAI
 
 from ..config import Config
@@ -21,6 +21,7 @@ class LLMClient:
     # Retry policy for transient API failures.
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 120.0  # seconds; a hung provider must not stall pipelines
+    MAX_JSON_TOKENS = 16384  # ceiling when chat_json grows the budget after truncation
 
     def __init__(
         self,
@@ -77,6 +78,10 @@ class LLMClient:
         # Retry transient failures (timeouts, 429, 5xx) with exponential backoff
         # so a single network blip doesn't abort a long pipeline. Permanent
         # errors (bad request, auth) are raised immediately.
+        return self._complete(kwargs)[0]
+
+    def _complete(self, kwargs: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        """Run one completion; return (content, finish_reason)."""
         response = call_with_retry(
             self.client.chat.completions.create,
             max_retries=self.MAX_RETRIES - 1,
@@ -86,14 +91,15 @@ class LLMClient:
             **kwargs,
         )
 
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
         # Content can be None (content filter, tool-only choice, empty
         # completion). Treat as empty rather than crashing in re.sub.
         if content is None:
-            return ''
+            return '', choice.finish_reason
         # Some models (e.g., MiniMax M2.5) include <think> content in the response; remove it
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
-        return content
+        return content, choice.finish_reason
 
     def chat_json(
         self,
@@ -112,12 +118,27 @@ class LLMClient:
         Returns:
             Parsed JSON object
         """
-        response = self.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"}
-        )
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        while True:
+            response, finish_reason = self._complete(kwargs)
+            # A response cut off at the token limit is incomplete JSON. Reasoning
+            # models spend part of max_tokens on hidden reasoning, so retry with
+            # a bigger budget rather than parsing (or "repairing") a truncated
+            # object and silently losing its tail.
+            if finish_reason != 'length' or kwargs["max_tokens"] >= self.MAX_JSON_TOKENS:
+                break
+            kwargs["max_tokens"] = min(kwargs["max_tokens"] * 2, self.MAX_JSON_TOKENS)
+            logger.warning(
+                "LLM JSON response truncated at the token limit; retrying with max_tokens=%d",
+                kwargs["max_tokens"],
+            )
+
         # Clean markdown code block markers
         cleaned_response = response.strip()
         cleaned_response = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_response, flags=re.IGNORECASE)
@@ -126,5 +147,7 @@ class LLMClient:
 
         try:
             return json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            raise ValueError(f"Invalid JSON format returned by LLM: {cleaned_response}")
+        except json.JSONDecodeError as e:
+            truncated = " (truncated at the token limit)" if finish_reason == 'length' else ""
+            logger.error("Invalid JSON from LLM%s: %s", truncated, cleaned_response)
+            raise ValueError(f"Invalid JSON format returned by LLM{truncated}: {e}") from e
