@@ -6,14 +6,15 @@ Uses preset scripts + LLM-powered configuration parameter generation
 
 import os
 import json
-import shutil
-from typing import Dict, Any, List, Optional
+import threading
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.atomic_io import atomic_write_json, atomic_write_text
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
@@ -128,41 +129,56 @@ class SimulationManager:
         '../../uploads/simulations'
     )
 
+    # Process-wide cache shared by every SimulationManager instance (the API
+    # creates one per request). Entries are keyed by the state file's mtime so
+    # a write from anywhere else (another thread, the runner's shutdown hook)
+    # invalidates them.
+    _cache: Dict[str, Tuple[int, SimulationState]] = {}
+    _cache_lock = threading.Lock()
+
     def __init__(self):
-        # Ensure directory exists
         os.makedirs(self.SIMULATION_DATA_DIR, exist_ok=True)
 
-        # In-memory simulation state cache
-        self._simulations: Dict[str, SimulationState] = {}
+    def _get_simulation_dir(self, simulation_id: str, create: bool = False) -> str:
+        """Get the simulation data directory.
 
-    def _get_simulation_dir(self, simulation_id: str) -> str:
-        """Get simulation data directory"""
+        Only write paths pass create=True: a read for an unknown id must not
+        leave an empty directory behind.
+        """
         sim_dir = os.path.join(self.SIMULATION_DATA_DIR, simulation_id)
-        os.makedirs(sim_dir, exist_ok=True)
+        if create:
+            os.makedirs(sim_dir, exist_ok=True)
         return sim_dir
 
-    def _save_simulation_state(self, state: SimulationState):
-        """Save simulation state to file"""
-        sim_dir = self._get_simulation_dir(state.simulation_id)
+    def _state_file(self, simulation_id: str) -> str:
+        return os.path.join(self._get_simulation_dir(simulation_id), "state.json")
+
+    def save_simulation_state(self, state: SimulationState):
+        """Save simulation state to file (atomically)"""
+        sim_dir = self._get_simulation_dir(state.simulation_id, create=True)
         state_file = os.path.join(sim_dir, "state.json")
 
         state.updated_at = datetime.now().isoformat()
-
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
-
-        self._simulations[state.simulation_id] = state
+        with self._cache_lock:
+            atomic_write_json(state_file, state.to_dict())
+            try:
+                mtime = os.stat(state_file).st_mtime_ns
+            except OSError:
+                mtime = -1
+            self._cache[state.simulation_id] = (mtime, state)
 
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
-        """Load simulation state from file"""
-        if simulation_id in self._simulations:
-            return self._simulations[simulation_id]
-
-        sim_dir = self._get_simulation_dir(simulation_id)
-        state_file = os.path.join(sim_dir, "state.json")
-
-        if not os.path.exists(state_file):
+        """Load simulation state from file (cached until the file changes)"""
+        state_file = self._state_file(simulation_id)
+        try:
+            mtime = os.stat(state_file).st_mtime_ns
+        except OSError:
             return None
+
+        with self._cache_lock:
+            cached = self._cache.get(simulation_id)
+            if cached and cached[0] == mtime:
+                return cached[1]
 
         with open(state_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -187,7 +203,8 @@ class SimulationManager:
             error=data.get("error"),
         )
 
-        self._simulations[simulation_id] = state
+        with self._cache_lock:
+            self._cache[simulation_id] = (mtime, state)
         return state
 
     def create_simulation(
@@ -221,7 +238,7 @@ class SimulationManager:
             status=SimulationStatus.CREATED,
         )
 
-        self._save_simulation_state(state)
+        self.save_simulation_state(state)
         logger.info(f"Created simulation: {simulation_id}, project={project_id}, graph={graph_id}")
 
         return state
@@ -264,9 +281,9 @@ class SimulationManager:
 
         try:
             state.status = SimulationStatus.PREPARING
-            self._save_simulation_state(state)
+            self.save_simulation_state(state)
 
-            sim_dir = self._get_simulation_dir(simulation_id)
+            sim_dir = self._get_simulation_dir(simulation_id, create=True)
 
             # ========== Phase 1: Read and filter entities ==========
             if progress_callback:
@@ -297,7 +314,7 @@ class SimulationManager:
             if filtered.filtered_count == 0:
                 state.status = SimulationStatus.FAILED
                 state.error = "No matching entities found. Please verify the graph was built correctly."
-                self._save_simulation_state(state)
+                self.save_simulation_state(state)
                 return state
 
             # ========== Phase 2: Generate Agent Profiles ==========
@@ -420,8 +437,7 @@ class SimulationManager:
 
             # Save configuration file
             config_path = os.path.join(sim_dir, "simulation_config.json")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(sim_params.to_json())
+            atomic_write_text(config_path, sim_params.to_json())
 
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
@@ -439,7 +455,7 @@ class SimulationManager:
 
             # Update status
             state.status = SimulationStatus.READY
-            self._save_simulation_state(state)
+            self.save_simulation_state(state)
 
             logger.info(f"Simulation preparation complete: {simulation_id}, "
                        f"entities={state.entities_count}, profiles={state.profiles_count}")
@@ -452,7 +468,7 @@ class SimulationManager:
             logger.error(traceback.format_exc())
             state.status = SimulationStatus.FAILED
             state.error = str(e)
-            self._save_simulation_state(state)
+            self.save_simulation_state(state)
             raise
 
     def get_simulation(self, simulation_id: str) -> Optional[SimulationState]:
@@ -470,7 +486,12 @@ class SimulationManager:
                 if sim_id.startswith('.') or not os.path.isdir(sim_path):
                     continue
 
-                state = self._load_simulation_state(sim_id)
+                try:
+                    state = self._load_simulation_state(sim_id)
+                except (OSError, ValueError) as e:
+                    # One unreadable/corrupt state.json must not break the list
+                    logger.warning(f"Skipping simulation {sim_id}: unreadable state.json ({e})")
+                    continue
                 if state:
                     if project_id is None or state.project_id == project_id:
                         simulations.append(state)

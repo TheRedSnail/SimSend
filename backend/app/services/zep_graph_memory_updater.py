@@ -6,16 +6,16 @@ Dynamically updates agent activities from simulations into the Zep graph
 import os
 import time
 import threading
-import json
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from datetime import datetime
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.retry import call_with_retry, is_transient_error
 
 logger = get_logger('mirofish.zep_graph_memory_updater')
 
@@ -229,6 +229,11 @@ class ZepGraphMemoryUpdater:
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # seconds
 
+    # Backpressure / shutdown limits (env-overridable)
+    MAX_QUEUE_SIZE = int(os.environ.get("SIMSEND_ZEP_QUEUE_MAX", "5000"))
+    FLUSH_TIMEOUT = float(os.environ.get("SIMSEND_ZEP_FLUSH_TIMEOUT", "30"))
+    FLUSH_CHUNK_SIZE = 20  # activities per episode when flushing a backlog
+
     def __init__(self, graph_id: str, api_key: Optional[str] = None):
         """
         Initialize the updater
@@ -245,8 +250,10 @@ class ZepGraphMemoryUpdater:
 
         self.client = Zep(api_key=self.api_key)
 
-        # Activity queue
-        self._activity_queue: Queue = Queue()
+        # Activity queue. Bounded: the producer (log monitor) is much faster
+        # than Zep ingestion, so an unbounded queue grows without limit on a
+        # big simulation. When full, the oldest pending activity is dropped.
+        self._activity_queue: Queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
 
         # Per-platform activity buffers (each platform accumulates to BATCH_SIZE before batch sending)
         self._platform_buffers: Dict[str, List[AgentActivity]] = {
@@ -257,6 +264,7 @@ class ZepGraphMemoryUpdater:
 
         # Control flags
         self._running = False
+        self._drain_deadline: Optional[float] = None
         self._worker_thread: Optional[threading.Thread] = None
 
         # Statistics
@@ -265,6 +273,7 @@ class ZepGraphMemoryUpdater:
         self._total_items_sent = 0  # Successfully sent activity count
         self._failed_count = 0      # Failed batch count
         self._skipped_count = 0     # Filtered/skipped activity count (DO_NOTHING)
+        self._dropped_count = 0     # Activities dropped (queue overflow or flush timeout)
 
         logger.info(f"ZepGraphMemoryUpdater initialized: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
 
@@ -286,22 +295,29 @@ class ZepGraphMemoryUpdater:
         self._worker_thread.start()
         logger.info(f"ZepGraphMemoryUpdater started: graph_id={self.graph_id}")
 
-    def stop(self):
-        """Stop background worker thread"""
+    def stop(self, flush_timeout: Optional[float] = None):
+        """Stop the worker and flush what is pending, within ``flush_timeout`` seconds.
+
+        Whatever cannot be sent before the deadline is dropped (and counted)
+        rather than blocking the caller indefinitely.
+        """
+        timeout = self.FLUSH_TIMEOUT if flush_timeout is None else flush_timeout
+        deadline = time.monotonic() + timeout
+        self._drain_deadline = deadline
         self._running = False
 
-        # Send remaining activities
-        self._flush_remaining()
-
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=10)
+            self._worker_thread.join(timeout=max(0.0, deadline - time.monotonic()) + 1)
+
+        self._flush_remaining(deadline)
 
         logger.info(f"ZepGraphMemoryUpdater stopped: graph_id={self.graph_id}, "
                    f"total_activities={self._total_activities}, "
                    f"batches_sent={self._total_sent}, "
                    f"items_sent={self._total_items_sent}, "
                    f"failed={self._failed_count}, "
-                   f"skipped={self._skipped_count}")
+                   f"skipped={self._skipped_count}, "
+                   f"dropped={self._dropped_count}")
 
     def add_activity(self, activity: AgentActivity):
         """
@@ -329,7 +345,21 @@ class ZepGraphMemoryUpdater:
             self._skipped_count += 1
             return
 
-        self._activity_queue.put(activity)
+        while True:
+            try:
+                self._activity_queue.put_nowait(activity)
+                break
+            except Full:
+                try:
+                    self._activity_queue.get_nowait()  # drop the oldest
+                except Empty:
+                    continue
+                self._dropped_count += 1
+                if self._dropped_count == 1 or self._dropped_count % 100 == 0:
+                    logger.warning(
+                        f"Zep activity queue full ({self.MAX_QUEUE_SIZE}); dropped "
+                        f"{self._dropped_count} oldest activities so far (graph={self.graph_id})"
+                    )
         self._total_activities += 1
         logger.debug(f"Added activity to Zep queue: {activity.agent_name} - {activity.action_type}")
 
@@ -357,105 +387,113 @@ class ZepGraphMemoryUpdater:
 
         self.add_activity(activity)
 
+    def _draining(self) -> bool:
+        """After stop(): keep draining the queue until the flush deadline."""
+        return (not self._running and self._drain_deadline is not None
+                and time.monotonic() < self._drain_deadline
+                and not self._activity_queue.empty())
+
     def _worker_loop(self):
         """Background worker loop - sends activities to Zep in batches by platform"""
-        while self._running or not self._activity_queue.empty():
+        while self._running or self._draining():
             try:
-                # Try to get activity from queue (1 second timeout)
                 try:
                     activity = self._activity_queue.get(timeout=1)
-
-                    # Add activity to the corresponding platform buffer
-                    platform = activity.platform.lower()
-                    batch = None
-                    with self._buffer_lock:
-                        if platform not in self._platform_buffers:
-                            self._platform_buffers[platform] = []
-                        self._platform_buffers[platform].append(activity)
-
-                        # Check if this platform has reached batch size; extract
-                        # the batch here but send it OUTSIDE the lock.
-                        if len(self._platform_buffers[platform]) >= self.BATCH_SIZE:
-                            batch = self._platform_buffers[platform][:self.BATCH_SIZE]
-                            self._platform_buffers[platform] = self._platform_buffers[platform][self.BATCH_SIZE:]
-
-                    # Network send + throttle happen without holding the buffer
-                    # lock, so get_stats()/flush/shutdown aren't blocked for the
-                    # duration of a slow/failing Zep call.
-                    if batch:
-                        self._send_batch_activities(batch, platform)
-                        time.sleep(self.SEND_INTERVAL)
-
                 except Empty:
-                    pass
+                    continue
+
+                platform = activity.platform.lower()
+                batch_size = self.BATCH_SIZE if self._running else self.FLUSH_CHUNK_SIZE
+                batch = None
+                with self._buffer_lock:
+                    buffer = self._platform_buffers.setdefault(platform, [])
+                    buffer.append(activity)
+                    # Extract the batch under the lock, send it outside.
+                    if len(buffer) >= batch_size:
+                        batch = buffer[:batch_size]
+                        self._platform_buffers[platform] = buffer[batch_size:]
+
+                if batch:
+                    self._send_batch_activities(batch, platform)
+                    if self._running:
+                        time.sleep(self.SEND_INTERVAL)
 
             except Exception as e:
                 logger.error(f"Worker loop exception: {e}")
                 time.sleep(1)
 
-    def _send_batch_activities(self, activities: List[AgentActivity], platform: str):
+    def _send_batch_activities(self, activities: List[AgentActivity], platform: str) -> bool:
         """
         Batch send activities to Zep graph (merged into a single text)
 
         Args:
             activities: List of agent activities
             platform: Platform name
+
+        Returns:
+            True when the batch was accepted by Zep
         """
         if not activities:
-            return
+            return True
 
         # Merge multiple activities into a single text, separated by newlines
-        episode_texts = [activity.to_episode_text() for activity in activities]
-        combined_text = "\n".join(episode_texts)
+        combined_text = "\n".join(activity.to_episode_text() for activity in activities)
 
-        # Send with retry
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                self.client.graph.add(
-                    graph_id=self.graph_id,
-                    type="text",
-                    data=combined_text
-                )
+        try:
+            call_with_retry(
+                self.client.graph.add,
+                graph_id=self.graph_id,
+                type="text",
+                data=combined_text,
+                max_retries=self.MAX_RETRIES - 1,
+                initial_delay=self.RETRY_DELAY,
+                retry_if=is_transient_error,
+                description="Zep batch send",
+            )
+        except Exception as e:
+            logger.error(f"Batch send to Zep failed ({len(activities)} activities): {e}")
+            self._failed_count += 1
+            return False
 
-                self._total_sent += 1
-                self._total_items_sent += len(activities)
-                display_name = self._get_platform_display_name(platform)
-                logger.info(f"Successfully batch sent {len(activities)} {display_name} activities to graph {self.graph_id}")
-                logger.debug(f"Batch content preview: {combined_text[:200]}...")
-                return
+        self._total_sent += 1
+        self._total_items_sent += len(activities)
+        display_name = self._get_platform_display_name(platform)
+        logger.info(f"Successfully batch sent {len(activities)} {display_name} activities to graph {self.graph_id}")
+        logger.debug(f"Batch content preview: {combined_text[:200]}...")
+        return True
 
-            except Exception as e:
-                if attempt < self.MAX_RETRIES - 1:
-                    logger.warning(f"Batch send to Zep failed (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}")
-                    time.sleep(self.RETRY_DELAY * (attempt + 1))
-                else:
-                    logger.error(f"Batch send to Zep failed after {self.MAX_RETRIES} retries: {e}")
-                    self._failed_count += 1
+    def _flush_remaining(self, deadline: Optional[float] = None):
+        """Send what is left in the queue and buffers, in bounded chunks, until ``deadline``."""
+        deadline = deadline if deadline is not None else time.monotonic() + self.FLUSH_TIMEOUT
 
-    def _flush_remaining(self):
-        """Send remaining activities in queue and buffers"""
-        # First process remaining activities in the queue and add to buffers
-        while not self._activity_queue.empty():
-            try:
-                activity = self._activity_queue.get_nowait()
-                platform = activity.platform.lower()
-                with self._buffer_lock:
-                    if platform not in self._platform_buffers:
-                        self._platform_buffers[platform] = []
-                    self._platform_buffers[platform].append(activity)
-            except Empty:
-                break
-
-        # Then send remaining activities in each platform buffer (even if less than BATCH_SIZE)
+        # Take everything out under the lock, send it without holding the lock.
         with self._buffer_lock:
-            for platform, buffer in self._platform_buffers.items():
-                if buffer:
-                    display_name = self._get_platform_display_name(platform)
-                    logger.info(f"Sending remaining {len(buffer)} {display_name} platform activities")
-                    self._send_batch_activities(buffer, platform)
-            # Clear all buffers
+            pending: Dict[str, List[AgentActivity]] = {
+                platform: list(buffer) for platform, buffer in self._platform_buffers.items()
+            }
             for platform in self._platform_buffers:
                 self._platform_buffers[platform] = []
+        while True:
+            try:
+                activity = self._activity_queue.get_nowait()
+            except Empty:
+                break
+            pending.setdefault(activity.platform.lower(), []).append(activity)
+
+        for platform, items in pending.items():
+            if items:
+                logger.info(f"Sending remaining {len(items)} {self._get_platform_display_name(platform)} activities")
+            # Chunked: one giant episode can exceed Zep's size limit and then
+            # fails (and is lost) as a whole.
+            for start in range(0, len(items), self.FLUSH_CHUNK_SIZE):
+                if time.monotonic() >= deadline:
+                    left = len(items) - start
+                    self._dropped_count += left
+                    logger.warning(
+                        f"Zep flush timed out; dropped {left} {platform} activities (graph={self.graph_id})"
+                    )
+                    break
+                self._send_batch_activities(items[start:start + self.FLUSH_CHUNK_SIZE], platform)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -470,6 +508,7 @@ class ZepGraphMemoryUpdater:
             "items_sent": self._total_items_sent,        # Successfully sent activity count
             "failed_count": self._failed_count,          # Failed batch count
             "skipped_count": self._skipped_count,        # Filtered/skipped activity count (DO_NOTHING)
+            "dropped_count": self._dropped_count,        # Dropped (queue overflow / flush timeout)
             "queue_size": self._activity_queue.qsize(),
             "buffer_sizes": buffer_sizes,                # Per-platform buffer sizes
             "running": self._running,
@@ -499,9 +538,11 @@ class ZepGraphMemoryManager:
             ZepGraphMemoryUpdater instance
         """
         with cls._lock:
-            # If one already exists, stop the old one first
-            if simulation_id in cls._updaters:
-                cls._updaters[simulation_id].stop()
+            # If one already exists, retire it (its flush runs in the background)
+            old = cls._updaters.pop(simulation_id, None)
+            if old is not None:
+                threading.Thread(target=old.stop, daemon=True,
+                                 name=f"ZepFlush-{simulation_id}").start()
 
             updater = ZepGraphMemoryUpdater(graph_id)
             updater.start()
@@ -516,13 +557,23 @@ class ZepGraphMemoryManager:
         return cls._updaters.get(simulation_id)
 
     @classmethod
-    def stop_updater(cls, simulation_id: str):
-        """Stop and remove a simulation's updater"""
+    def stop_updater(cls, simulation_id: str, wait: bool = True):
+        """Stop and remove a simulation's updater.
+
+        With wait=False the bounded flush runs on a background thread, so an
+        HTTP request (e.g. /stop) isn't held up by Zep ingestion.
+        """
         with cls._lock:
-            if simulation_id in cls._updaters:
-                cls._updaters[simulation_id].stop()
-                del cls._updaters[simulation_id]
-                logger.info(f"Stopped graph memory updater: simulation_id={simulation_id}")
+            updater = cls._updaters.pop(simulation_id, None)
+        if updater is None:
+            return
+        if wait:
+            updater.stop()
+        else:
+            threading.Thread(
+                target=updater.stop, daemon=True, name=f"ZepFlush-{simulation_id}"
+            ).start()
+        logger.info(f"Stopped graph memory updater: simulation_id={simulation_id}")
 
     # Flag to prevent stop_all from being called multiple times
     _stop_all_done = False
@@ -536,19 +587,26 @@ class ZepGraphMemoryManager:
         cls._stop_all_done = True
 
         with cls._lock:
-            if cls._updaters:
-                for simulation_id, updater in list(cls._updaters.items()):
-                    try:
-                        updater.stop()
-                    except Exception as e:
-                        logger.error(f"Failed to stop updater: simulation_id={simulation_id}, error={e}")
-                cls._updaters.clear()
-            logger.info("All graph memory updaters stopped")
+            updaters = list(cls._updaters.items())
+            cls._updaters.clear()
+
+        # Flush in parallel so N simulations don't cost N x FLUSH_TIMEOUT at shutdown.
+        def stop_one(simulation_id, updater):
+            try:
+                updater.stop()
+            except Exception as e:
+                logger.error(f"Failed to stop updater: simulation_id={simulation_id}, error={e}")
+
+        threads = [threading.Thread(target=stop_one, args=item, daemon=True) for item in updaters]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=ZepGraphMemoryUpdater.FLUSH_TIMEOUT + 5)
+        logger.info("All graph memory updaters stopped")
 
     @classmethod
     def get_all_stats(cls) -> Dict[str, Dict[str, Any]]:
         """Get statistics for all updaters"""
-        return {
-            sim_id: updater.get_stats()
-            for sim_id, updater in cls._updaters.items()
-        }
+        with cls._lock:
+            updaters = list(cls._updaters.items())
+        return {sim_id: updater.get_stats() for sim_id, updater in updaters}

@@ -3,7 +3,6 @@ Graph Building Service
 Interface 2: Build Standalone Graph using Zep API
 """
 
-import os
 import uuid
 import time
 import threading
@@ -157,7 +156,7 @@ class GraphBuilderService:
                 message="Waiting for Zep to process data..."
             )
             
-            self._wait_for_episodes(
+            fully_processed = self.wait_for_episodes(
                 episode_uuids,
                 lambda msg, prog: self.task_manager.update_task(
                     task_id,
@@ -175,11 +174,13 @@ class GraphBuilderService:
             
             graph_info = self._get_graph_info(graph_id)
             
-            # Complete
+            # Complete -- flag a graph whose episodes didn't all finish
+            # processing instead of presenting it as complete.
             self.task_manager.complete_task(task_id, {
                 "graph_id": graph_id,
                 "graph_info": graph_info.to_dict(),
                 "chunks_processed": total_chunks,
+                "partial": not fully_processed,
             })
             
         except Exception as e:
@@ -345,13 +346,25 @@ class GraphBuilderService:
         
         return episode_uuids
     
-    def _wait_for_episodes(
+    # Polling cadence for Zep episode processing: start fast, back off while
+    # nothing changes. Give up after this many consecutive rounds in which
+    # every status query failed.
+    EPISODE_POLL_INITIAL = 3.0
+    EPISODE_POLL_MAX = 15.0
+    EPISODE_MAX_FAILED_ROUNDS = 5
+
+    def wait_for_episodes(
         self,
         episode_uuids: List[str],
         progress_callback: Optional[Callable] = None,
         timeout: int = 600
-    ):
-        """Wait for all episodes to finish processing (by querying each episode's processed status)"""
+    ) -> bool:
+        """Wait for all episodes to finish processing.
+
+        Returns True when every episode is processed, False on timeout (the
+        graph is then only partially built and callers must say so).
+        Raises RuntimeError when Zep status queries keep failing.
+        """
         if not episode_uuids:
             if progress_callback:
                 progress_callback("No waiting needed (no episodes)", 1.0)
@@ -359,52 +372,76 @@ class GraphBuilderService:
 
         start_time = time.time()
         pending_episodes = set(episode_uuids)
-        completed_count = 0
         total_episodes = len(episode_uuids)
-        timed_out = False
+        poll_interval = self.EPISODE_POLL_INITIAL
+        failed_rounds = 0
         
         if progress_callback:
             progress_callback(f"Waiting for {total_episodes} text chunks to process...", 0)
         
         while pending_episodes:
             if time.time() - start_time > timeout:
-                timed_out = True
+                completed = total_episodes - len(pending_episodes)
+                logger.warning(
+                    f"Timed out waiting for Zep episodes: {completed}/{total_episodes} processed "
+                    f"after {timeout}s"
+                )
                 if progress_callback:
                     progress_callback(
-                        f"Some text chunks timed out, completed {completed_count}/{total_episodes}",
-                        completed_count / total_episodes
+                        f"Some text chunks timed out, completed {completed}/{total_episodes}",
+                        completed / total_episodes
                     )
-                break
+                return False
             
-            # Check processing status of each episode
-            for ep_uuid in list(pending_episodes):
+            progressed = False
+            errors = 0
+            last_error = None
+            to_query = list(pending_episodes)
+            for ep_uuid in to_query:
                 try:
                     episode = self.client.graph.episode.get(uuid_=ep_uuid)
-                    is_processed = getattr(episode, 'processed', False)
+                except Exception as e:  # noqa: BLE001 - Zep SDK errors are untyped
+                    errors += 1
+                    last_error = e
+                    continue
+                if getattr(episode, 'processed', False):
+                    pending_episodes.discard(ep_uuid)
+                    progressed = True
                     
-                    if is_processed:
-                        pending_episodes.remove(ep_uuid)
-                        completed_count += 1
+            if errors == len(to_query):
+                failed_rounds += 1
+                logger.warning(
+                    f"All {errors} episode status queries failed "
+                    f"({failed_rounds}/{self.EPISODE_MAX_FAILED_ROUNDS}): {last_error}"
+                )
+                if failed_rounds >= self.EPISODE_MAX_FAILED_ROUNDS:
+                    raise RuntimeError(f"Zep episode status queries keep failing: {last_error}")
+            else:
+                if errors:
+                    logger.warning(f"{errors} episode status queries failed this round: {last_error}")
+                failed_rounds = 0
                         
-                except Exception as e:
-                    # Ignore individual query errors, continue
-                    pass
-            
+            completed = total_episodes - len(pending_episodes)
             elapsed = int(time.time() - start_time)
             if progress_callback:
                 progress_callback(
-                    f"Zep processing... {completed_count}/{total_episodes} completed, {len(pending_episodes)} pending ({elapsed}s)",
-                    completed_count / total_episodes if total_episodes > 0 else 0
+                    f"Zep processing... {completed}/{total_episodes} completed, "
+                    f"{len(pending_episodes)} pending ({elapsed}s)",
+                    completed / total_episodes
                 )
             
             if pending_episodes:
-                time.sleep(3)  # Check every 3 seconds
+                # Back off while Zep is not making progress, reset when it is.
+                poll_interval = self.EPISODE_POLL_INITIAL if progressed else min(
+                    poll_interval * 1.5, self.EPISODE_POLL_MAX)
+                time.sleep(poll_interval)
 
-        # Only report full completion when genuinely done — not on timeout, which
-        # would mask a partially-built graph as complete.
-        if not timed_out and progress_callback:
-            progress_callback(f"Processing complete: {completed_count}/{total_episodes}", 1.0)
-        return not timed_out
+        if progress_callback:
+            progress_callback(f"Processing complete: {total_episodes}/{total_episodes}", 1.0)
+        return True
+
+    # Backwards-compatible private name (api/graph.py calls it)
+    _wait_for_episodes = wait_for_episodes
     
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """Get graph information"""

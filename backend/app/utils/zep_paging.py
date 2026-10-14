@@ -11,10 +11,10 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from zep_cloud import InternalServerError
 from zep_cloud.client import Zep
 
 from .logger import get_logger
+from .retry import is_transient_error, retry_after_seconds
 
 logger = get_logger('mirofish.zep_paging')
 
@@ -33,7 +33,11 @@ def _fetch_page_with_retry(
     page_description: str = "page",
     **kwargs: Any,
 ) -> list[Any]:
-    """Single-page request with exponential backoff retry. Only retries transient network/IO errors."""
+    """Single-page request with exponential backoff retry.
+
+    Only transient failures are retried (network errors, 429 -- honoring
+    Retry-After -- and 5xx); other client errors are raised immediately.
+    """
     if max_retries < 1:
         raise ValueError("max_retries must be >= 1")
 
@@ -43,9 +47,14 @@ def _fetch_page_with_retry(
     for attempt in range(max_retries):
         try:
             return api_call(*args, **kwargs)
-        except (ConnectionError, TimeoutError, OSError, InternalServerError) as e:
+        except Exception as e:
+            if not is_transient_error(e):
+                raise  # 4xx (other than 429) won't succeed on retry
             last_exception = e
             if attempt < max_retries - 1:
+                requested = retry_after_seconds(e)
+                if requested is not None:
+                    delay = max(delay, requested)
                 logger.warning(
                     f"Zep {page_description} attempt {attempt + 1} failed: {str(e)[:100]}, retrying in {delay:.1f}s..."
                 )

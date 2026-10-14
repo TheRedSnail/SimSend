@@ -3,7 +3,6 @@ Zep Entity Reader and Filter Service
 Read nodes from Zep graph, filter nodes matching predefined entity types
 """
 
-import time
 from typing import Dict, Any, List, Optional, Set, Callable, TypeVar
 from dataclasses import dataclass, field
 
@@ -11,6 +10,7 @@ from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.retry import call_with_retry, is_transient_error
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 
 logger = get_logger('mirofish.zep_entity_reader')
@@ -93,7 +93,7 @@ class ZepEntityReader:
         initial_delay: float = 2.0
     ) -> T:
         """
-        Zep API call with retry mechanism
+        Zep API call, retried only on transient failures (network, 429, 5xx)
 
         Args:
             func: Function to execute (parameterless lambda or callable)
@@ -104,25 +104,13 @@ class ZepEntityReader:
         Returns:
             API call result
         """
-        last_exception = None
-        delay = initial_delay
-        
-        for attempt in range(max_retries):
-            try:
-                return func()
-            except Exception as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Zep {operation_name} attempt {attempt + 1} failed: {str(e)[:100]}, "
-                        f"retrying in {delay:.1f}s..."
-                    )
-                    time.sleep(delay)
-                    delay *= 2  # Exponential backoff
-                else:
-                    logger.error(f"Zep {operation_name} still failing after {max_retries} attempts: {str(e)}")
-        
-        raise last_exception
+        return call_with_retry(
+            func,
+            max_retries=max_retries - 1,
+            initial_delay=initial_delay,
+            retry_if=is_transient_error,
+            description=f"Zep {operation_name}",
+        )
     
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
         """

@@ -68,11 +68,10 @@ import argparse
 import asyncio
 import json
 import logging
-import multiprocessing
 import random
 import signal
 import sqlite3
-import warnings
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -250,6 +249,32 @@ def _archive_or_remove_db(db_path, log_fn=print):
         log_fn(f"Could not remove previous DB (still locked?): {e}")
 
 
+def write_json_atomic(path: str, data: Dict[str, Any], attempts: int = 5) -> None:
+    """Write JSON so a concurrent reader never sees a torn file.
+
+    Writes a sibling temp file and os.replace()s it into place. On Windows the
+    replace fails with PermissionError while the backend has the target open
+    for reading, so retry briefly before giving up.
+    """
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 # IPC related constants
 IPC_COMMANDS_DIR = "ipc_commands"
 IPC_RESPONSES_DIR = "ipc_responses"
@@ -293,13 +318,12 @@ class ParallelIPCHandler:
     
     def update_status(self, status: str):
         """Update environment status"""
-        with open(self.status_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                "status": status,
-                "twitter_available": self.twitter_env is not None,
-                "reddit_available": self.reddit_env is not None,
-                "timestamp": datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        write_json_atomic(self.status_file, {
+            "status": status,
+            "twitter_available": self.twitter_env is not None,
+            "reddit_available": self.reddit_env is not None,
+            "timestamp": datetime.now().isoformat()
+        })
     
     def poll_command(self) -> Optional[Dict[str, Any]]:
         """Poll for pending commands"""
@@ -341,8 +365,7 @@ class ParallelIPCHandler:
         }
         
         response_file = os.path.join(self.responses_dir, f"{command_id}.json")
-        with open(response_file, 'w', encoding='utf-8') as f:
-            json.dump(response, f, ensure_ascii=False, indent=2)
+        write_json_atomic(response_file, response)
         
         # Delete command file
         command_file = os.path.join(self.commands_dir, f"{command_id}.json")
@@ -392,6 +415,8 @@ class ParallelIPCHandler:
 
             result = self._get_interview_result(agent_id, actual_platform, after_rowid=baseline_rowid)
             result["platform"] = actual_platform
+            if result.get("response") is None:
+                return {"platform": actual_platform, "error": "No interview response recorded"}
             return result
             
         except Exception as e:
@@ -503,71 +528,60 @@ class ParallelIPCHandler:
                 reddit_interviews.extend(both_platforms_interviews)
         
         results = {}
+        for platform_name, platform_interviews in (("twitter", twitter_interviews), ("reddit", reddit_interviews)):
+            results.update(await self._batch_interview_platform(platform_name, platform_interviews))
         
-        # Process Twitter platform interviews
-        if twitter_interviews and self.twitter_env:
-            try:
-                twitter_actions = {}
-                for interview in twitter_interviews:
-                    agent_id = interview.get("agent_id")
-                    prompt = interview.get("prompt", "")
-                    try:
-                        agent = self.twitter_agent_graph.get_agent(agent_id)
-                        twitter_actions[agent] = ManualAction(
-                            action_type=ActionType.INTERVIEW,
-                            action_args={"prompt": prompt}
-                        )
-                    except Exception as e:
-                        print(f"  Warning: Cannot get Twitter Agent {agent_id}: {e}")
-                
-                if twitter_actions:
-                    await self.twitter_env.step(twitter_actions)
-                    
-                    for interview in twitter_interviews:
-                        agent_id = interview.get("agent_id")
-                        result = self._get_interview_result(agent_id, "twitter")
-                        result["platform"] = "twitter"
-                        results[f"twitter_{agent_id}"] = result
-            except Exception as e:
-                print(f"  Twitter batch interview failed: {e}")
-        
-        # Process Reddit platform interviews
-        if reddit_interviews and self.reddit_env:
-            try:
-                reddit_actions = {}
-                for interview in reddit_interviews:
-                    agent_id = interview.get("agent_id")
-                    prompt = interview.get("prompt", "")
-                    try:
-                        agent = self.reddit_agent_graph.get_agent(agent_id)
-                        reddit_actions[agent] = ManualAction(
-                            action_type=ActionType.INTERVIEW,
-                            action_args={"prompt": prompt}
-                        )
-                    except Exception as e:
-                        print(f"  Warning: Cannot get Reddit Agent {agent_id}: {e}")
-                
-                if reddit_actions:
-                    await self.reddit_env.step(reddit_actions)
-                    
-                    for interview in reddit_interviews:
-                        agent_id = interview.get("agent_id")
-                        result = self._get_interview_result(agent_id, "reddit")
-                        result["platform"] = "reddit"
-                        results[f"reddit_{agent_id}"] = result
-            except Exception as e:
-                print(f"  Reddit batch interview failed: {e}")
-        
-        if results:
+        succeeded = sum(1 for r in results.values() if r.get("response") is not None)
+        if succeeded:
             self.send_response(command_id, "completed", result={
                 "interviews_count": len(results),
+                "succeeded_count": succeeded,
                 "results": results
             })
-            print(f"  Batch interview completed: {len(results)} agents")
+            print(f"  Batch interview completed: {succeeded}/{len(results)} agents answered")
             return True
         else:
             self.send_response(command_id, "failed", error="No successful interviews")
             return False
+
+    async def _batch_interview_platform(self, platform: str, interviews: List[Dict]) -> Dict[str, Any]:
+        """Interview several agents on one platform in a single env.step.
+
+        Results only accept trace rows newer than the pre-step baseline, so an
+        agent whose interview failed reports no response instead of returning
+        its previous answer.
+        """
+        env, agent_graph, _ = self._get_env_and_graph(platform)
+        if not interviews or not env:
+            return {}
+        results = {}
+        try:
+            actions = {}
+            for interview in interviews:
+                agent_id = interview.get("agent_id")
+                try:
+                    agent = agent_graph.get_agent(agent_id)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  Warning: Cannot get {platform} Agent {agent_id}: {e}")
+                    continue
+                actions[agent] = ManualAction(
+                    action_type=ActionType.INTERVIEW,
+                    action_args={"prompt": interview.get("prompt", "")}
+                )
+            if not actions:
+                return {}
+            baseline_rowid = self._max_trace_rowid(platform)
+            await env.step(actions)
+            for interview in interviews:
+                agent_id = interview.get("agent_id")
+                result = self._get_interview_result(agent_id, platform, after_rowid=baseline_rowid)
+                result["platform"] = platform
+                if result.get("response") is None:
+                    result["error"] = "No interview response recorded"
+                results[f"{platform}_{agent_id}"] = result
+        except Exception as e:  # noqa: BLE001
+            print(f"  {platform} batch interview failed: {e}")
+        return results
     
     def _max_trace_rowid(self, platform: str) -> int:
         """Return the current MAX(rowid) of the trace table (or 0).
@@ -592,10 +606,10 @@ class ParallelIPCHandler:
         except Exception:
             return 0
 
-    def _get_interview_result(self, agent_id: int, platform: str, after_rowid: int = 0) -> Dict[str, Any]:
+    def _get_interview_result(self, agent_id: int, platform: str, after_rowid: Optional[int] = None) -> Dict[str, Any]:
         """Get the latest interview result from the database.
 
-        When after_rowid > 0, only a trace row newer than that baseline is
+        When after_rowid is given, only a trace row newer than that baseline is
         accepted, so a stale prior answer is never returned as the current one.
         """
         db_path = os.path.join(self.simulation_dir, f"{platform}_simulation.db")
@@ -615,7 +629,7 @@ class ParallelIPCHandler:
 
             # Query the latest interview record (only fresh rows when a baseline
             # rowid is supplied, so a failed interview can't return stale data).
-            if after_rowid and after_rowid > 0:
+            if after_rowid is not None and after_rowid >= 0:
                 cursor.execute("""
                     SELECT user_id, info, created_at
                     FROM trace
@@ -649,16 +663,17 @@ class ParallelIPCHandler:
         
         return result
     
-    async def process_commands(self) -> bool:
+    async def process_commands(self) -> Tuple[bool, bool]:
         """
-        Process all pending commands
+        Process the next pending command
 
         Returns:
-            True to continue running, False to exit
+            (handled, should_continue): handled is True when a command was
+            processed; should_continue is False when the env must shut down.
         """
         command = self.poll_command()
         if not command:
-            return True
+            return False, True
         
         command_id = command.get("command_id")
         command_type = command.get("command_type")
@@ -673,7 +688,7 @@ class ParallelIPCHandler:
                 args.get("prompt", ""),
                 args.get("platform")
             )
-            return True
+            return True, True
             
         elif command_type == CommandType.BATCH_INTERVIEW:
             await self.handle_batch_interview(
@@ -681,16 +696,16 @@ class ParallelIPCHandler:
                 args.get("interviews", []),
                 args.get("platform")
             )
-            return True
+            return True, True
             
         elif command_type == CommandType.CLOSE_ENV:
             print("Received close environment command")
             self.send_response(command_id, "completed", result={"message": "Environment shutting down"})
-            return False
+            return True, False
         
         else:
             self.send_response(command_id, "failed", error=f"Unknown command type: {command_type}")
-            return True
+            return True, True
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -1201,418 +1216,267 @@ def get_active_agents_for_round(
 
 class PlatformSimulation:
     """Platform simulation result container"""
-    def __init__(self):
+    def __init__(self, platform: str = ""):
+        self.platform = platform
         self.env = None
         self.agent_graph = None
         self.total_actions = 0
+        self.rounds_completed = 0
+        # "completed" | "stopped" | "failed"
+        self.outcome = "failed"
+        self.error: Optional[str] = None
 
 
-async def run_twitter_simulation(
+# How many times a failed env.step is attempted before the run is aborted.
+STEP_MAX_ATTEMPTS = max(1, int(os.environ.get("SIMSEND_STEP_MAX_ATTEMPTS", "3")))
+STEP_RETRY_DELAY_SECONDS = float(os.environ.get("SIMSEND_STEP_RETRY_DELAY", "5"))
+
+_PLATFORM_SETTINGS = {
+    "twitter": {
+        "label": "Twitter",
+        "profile_file": "twitter_profiles.csv",  # OASIS Twitter uses CSV
+        "db_file": "twitter_simulation.db",
+        "use_boost": False,  # Twitter uses the general / swarm LLM lane
+    },
+    "reddit": {
+        "label": "Reddit",
+        "profile_file": "reddit_profiles.json",
+        "db_file": "reddit_simulation.db",
+        "use_boost": True,  # Reddit uses the boost LLM when configured
+    },
+}
+
+
+def compute_total_rounds(config: Dict[str, Any], max_rounds: Optional[int] = None) -> int:
+    time_config = config.get("time_config", {})
+    total_hours = time_config.get("total_simulation_hours", 72)
+    minutes_per_round = max(int(time_config.get("minutes_per_round", 30) or 30), 1)
+    total_rounds = int(total_hours * 60) // minutes_per_round
+    if max_rounds is not None and max_rounds > 0:
+        total_rounds = min(total_rounds, max_rounds)
+    return total_rounds
+
+
+async def _step_with_retry(env, actions, log_info, what: str):
+    """Run env.step, retrying transient failures. Re-raises the last error."""
+    last_err = None
+    for attempt in range(1, STEP_MAX_ATTEMPTS + 1):
+        try:
+            await env.step(actions)
+            return
+        except Exception as err:  # noqa: BLE001 - OASIS/LLM errors are untyped
+            last_err = err
+            if attempt < STEP_MAX_ATTEMPTS:
+                delay = STEP_RETRY_DELAY_SECONDS * attempt
+                log_info(f"env.step failed during {what} (attempt {attempt}/{STEP_MAX_ATTEMPTS}): "
+                         f"{err}; retrying in {delay:.0f}s")
+                await asyncio.sleep(delay)
+    raise last_err
+
+
+async def run_platform_simulation(
+    platform: str,
     config: Dict[str, Any], 
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
     max_rounds: Optional[int] = None
 ) -> PlatformSimulation:
-    """Run Twitter simulation
+    """Run one platform's simulation loop.
 
-    Args:
-        config: Simulation configuration
-        simulation_dir: Simulation directory
-        action_logger: Action logger
-        main_logger: Main log manager
-        max_rounds: Maximum simulation rounds (optional, for truncating overly long simulations)
-
-    Returns:
-        PlatformSimulation: Result object containing env and agent_graph
+    Every exit path writes exactly one terminal event to the platform's
+    actions.jsonl so the backend never has to guess:
+      - simulation_end      every configured round ran
+      - simulation_stopped  a shutdown signal interrupted the loop
+      - simulation_failed   setup or a round failed after retries
     """
-    result = PlatformSimulation()
+    settings = _PLATFORM_SETTINGS[platform]
+    result = PlatformSimulation(platform)
+    label = settings["label"]
+    total_rounds = compute_total_rounds(config, max_rounds)
+    total_actions = 0
     
     def log_info(msg):
         if main_logger:
-            main_logger.info(f"[Twitter] {msg}")
-        print(f"[Twitter] {msg}")
+            main_logger.info(f"[{label}] {msg}")
+        print(f"[{label}] {msg}")
     
-    log_info("Initializing...")
-    
-    # Twitter uses general LLM configuration
-    model = create_model(config, use_boost=False)
-    
-    # OASIS Twitter uses CSV format
-    profile_path = os.path.join(simulation_dir, "twitter_profiles.csv")
-    if not os.path.exists(profile_path):
-        log_info(f"Error: Profile file not found: {profile_path}")
+    def fail(error: str) -> PlatformSimulation:
+        result.outcome = "failed"
+        result.error = error
+        result.total_actions = total_actions
+        log_info(f"Simulation failed after {result.rounds_completed} rounds: {error}")
+        if action_logger:
+            action_logger.log_simulation_failed(result.rounds_completed, total_rounds, total_actions, error)
         return result
     
-    result.agent_graph = await generate_twitter_agent_graph(
-        profile_path=profile_path,
-        model=model,
-        available_actions=TWITTER_ACTIONS,
-    )
+    try:
+        log_info("Initializing...")
+        model = create_model(config, use_boost=settings["use_boost"])
     
-    # Get agent real name mapping from config (using entity_name instead of default Agent_X)
-    agent_names = get_agent_names_from_config(config)
-    # If an agent is not in the config, use OASIS default name
-    for agent_id, agent in result.agent_graph.get_agents():
-        if agent_id not in agent_names:
-            agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
+        profile_path = os.path.join(simulation_dir, settings["profile_file"])
+        if not os.path.exists(profile_path):
+            return fail(f"Profile file not found: {profile_path}")
     
-    db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    _archive_or_remove_db(db_path, log_info)
+        if platform == "twitter":
+            result.agent_graph = await generate_twitter_agent_graph(
+                profile_path=profile_path, model=model, available_actions=TWITTER_ACTIONS,
+            )
+            platform_type = oasis.DefaultPlatformType.TWITTER
+        else:
+            result.agent_graph = await generate_reddit_agent_graph(
+                profile_path=profile_path, model=model, available_actions=REDDIT_ACTIONS,
+            )
+            platform_type = oasis.DefaultPlatformType.REDDIT
 
-    result.env = oasis.make(
-        agent_graph=result.agent_graph,
-        platform=oasis.DefaultPlatformType.TWITTER,
-        database_path=db_path,
-        semaphore=30,  # Limit max concurrent LLM requests to prevent API overload
-    )
+        # Real entity names instead of generic Agent_X labels
+        agent_names = get_agent_names_from_config(config)
+        for agent_id, agent in result.agent_graph.get_agents():
+            if agent_id not in agent_names:
+                agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
     
-    await result.env.reset()
-    log_info("Environment started")
+        db_path = os.path.join(simulation_dir, settings["db_file"])
+        _archive_or_remove_db(db_path, log_info)
+
+        result.env = oasis.make(
+            agent_graph=result.agent_graph,
+            platform=platform_type,
+            database_path=db_path,
+            semaphore=30,  # Limit max concurrent LLM requests to prevent API overload
+        )
+        await result.env.reset()
+        log_info("Environment started")
+    except Exception as e:  # noqa: BLE001
+        return fail(f"Setup failed: {e}")
     
     if action_logger:
-        action_logger.log_simulation_start(config)
+        action_logger.log_simulation_start(config, total_rounds)
     
-    total_actions = 0
-    last_rowid = 0  # Track last processed row in database (using rowid to avoid created_at format differences)
+    last_rowid = 0  # Last processed trace rowid (rowid avoids created_at format differences)
     
-    # Execute initial events
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # Log round 0 start (initial events phase)
+    # Round 0: initial posts
     if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
+        action_logger.log_round_start(0, 0)
     initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
-                    action_type=ActionType.CREATE_POST,
-                    action_args={"content": content}
-                )
-                
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
-                        action_args={"content": content}
-                    )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"Published {len(initial_actions)} initial posts")
+    initial_actions = {}
+    for post in config.get("event_config", {}).get("initial_posts", []):
+        agent_id = post.get("poster_agent_id", 0)
+        content = post.get("content", "")
+        try:
+            agent = result.env.agent_graph.get_agent(agent_id)
+        except Exception as e:  # noqa: BLE001
+            log_info(f"Skipping initial post for unknown agent {agent_id}: {e}")
+            continue
+        action = ManualAction(action_type=ActionType.CREATE_POST, action_args={"content": content})
+        # One agent may author several initial posts: keep them all.
+        if agent in initial_actions:
+            existing = initial_actions[agent]
+            initial_actions[agent] = (existing if isinstance(existing, list) else [existing]) + [action]
+        else:
+            initial_actions[agent] = action
+        if action_logger:
+            action_logger.log_action(
+                round_num=0,
+                agent_id=agent_id,
+                agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                action_type="CREATE_POST",
+                action_args={"content": content}
+            )
+        total_actions += 1
+        initial_action_count += 1
     
-    # Log round 0 end
+    if initial_actions:
+        try:
+            await _step_with_retry(result.env, initial_actions, log_info, "initial posts")
+        except Exception as e:  # noqa: BLE001
+            return fail(f"Initial posts failed: {e}")
+        log_info(f"Published {initial_action_count} initial posts")
     if action_logger:
         action_logger.log_round_end(0, initial_action_count)
     
     # Main simulation loop
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get("total_simulation_hours", 72)
-    minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-    
-    # If max rounds is specified, truncate
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+    minutes_per_round = max(int(config.get("time_config", {}).get("minutes_per_round", 30) or 30), 1)
     start_time = datetime.now()
     
     for round_num in range(total_rounds):
-        # Check if shutdown signal received
         if _shutdown_event and _shutdown_event.is_set():
-            if main_logger:
-                main_logger.info(f"Received shutdown signal, stopping simulation at round {round_num + 1}")
-            break
+            log_info(f"Received shutdown signal, stopping before round {round_num + 1}")
+            result.outcome = "stopped"
+            result.total_actions = total_actions
+            if action_logger:
+                action_logger.log_simulation_stopped(result.rounds_completed, total_rounds, total_actions)
+            return result
         
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
         
-        active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
-        )
+        active_agents = get_active_agents_for_round(result.env, config, simulated_hour, round_num)
         
-        # Log round start regardless of whether there are active agents
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
         
-        if not active_agents:
-            # Log round end even when there are no active agents (actions_count=0)
-            if action_logger:
-                action_logger.log_round_end(round_num + 1, 0)
-            continue
-        
-        actions = {agent: LLMAction() for _, agent in active_agents}
-        try:
-            await result.env.step(actions)
-        except Exception as step_err:
-            # A transient LLM/network error in a single round must not abort the
-            # whole process (which would skip log_simulation_end and leave the
-            # environment un-closed). End the loop gracefully so completion is
-            # still logged and the env stays available for interviews.
-            log_info(f"env.step failed at round {round_num + 1}: {step_err}; ending simulation early")
-            break
-
-        # Fetch actually executed actions from database and log them
-        actual_actions, last_rowid = fetch_new_actions_from_db(
-            db_path, last_rowid, agent_names
-        )
-        
         round_action_count = 0
-        for action_data in actual_actions:
-            if action_logger:
-                action_logger.log_action(
-                    round_num=round_num + 1,
-                    agent_id=action_data['agent_id'],
-                    agent_name=action_data['agent_name'],
-                    action_type=action_data['action_type'],
-                    action_args=action_data['action_args']
-                )
-                total_actions += 1
-                round_action_count += 1
-        
-        if action_logger:
-            action_logger.log_round_end(round_num + 1, round_action_count)
-        
-        if (round_num + 1) % 20 == 0:
-            progress = (round_num + 1) / total_rounds * 100
-            log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
-    # Note: Do not close the environment, keep it available for interviews
-    
-    if action_logger:
-        action_logger.log_simulation_end(total_rounds, total_actions)
-    
-    result.total_actions = total_actions
-    elapsed = (datetime.now() - start_time).total_seconds()
-    log_info(f"Simulation loop completed! Elapsed: {elapsed:.1f}s, total actions: {total_actions}")
-    
-    return result
-
-
-async def run_reddit_simulation(
-    config: Dict[str, Any], 
-    simulation_dir: str,
-    action_logger: Optional[PlatformActionLogger] = None,
-    main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
-) -> PlatformSimulation:
-    """Run Reddit simulation
-
-    Args:
-        config: Simulation configuration
-        simulation_dir: Simulation directory
-        action_logger: Action logger
-        main_logger: Main log manager
-        max_rounds: Maximum simulation rounds (optional, for truncating overly long simulations)
-
-    Returns:
-        PlatformSimulation: Result object containing env and agent_graph
-    """
-    result = PlatformSimulation()
-    
-    def log_info(msg):
-        if main_logger:
-            main_logger.info(f"[Reddit] {msg}")
-        print(f"[Reddit] {msg}")
-    
-    log_info("Initializing...")
-    
-    # Reddit uses boost LLM configuration (if available, otherwise falls back to general config)
-    model = create_model(config, use_boost=True)
-    
-    profile_path = os.path.join(simulation_dir, "reddit_profiles.json")
-    if not os.path.exists(profile_path):
-        log_info(f"Error: Profile file not found: {profile_path}")
-        return result
-    
-    result.agent_graph = await generate_reddit_agent_graph(
-        profile_path=profile_path,
-        model=model,
-        available_actions=REDDIT_ACTIONS,
-    )
-    
-    # Get agent real name mapping from config (using entity_name instead of default Agent_X)
-    agent_names = get_agent_names_from_config(config)
-    # If an agent is not in the config, use OASIS default name
-    for agent_id, agent in result.agent_graph.get_agents():
-        if agent_id not in agent_names:
-            agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
-    db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    _archive_or_remove_db(db_path, log_info)
-
-    result.env = oasis.make(
-        agent_graph=result.agent_graph,
-        platform=oasis.DefaultPlatformType.REDDIT,
-        database_path=db_path,
-        semaphore=30,  # Limit max concurrent LLM requests to prevent API overload
-    )
-    
-    await result.env.reset()
-    log_info("Environment started")
-    
-    if action_logger:
-        action_logger.log_simulation_start(config)
-    
-    total_actions = 0
-    last_rowid = 0  # Track last processed row in database (using rowid to avoid created_at format differences)
-    
-    # Execute initial events
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # Log round 0 start (initial events phase)
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
+        if active_agents:
+            actions = {agent: LLMAction() for _, agent in active_agents}
             try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                if agent in initial_actions:
-                    if not isinstance(initial_actions[agent], list):
-                        initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    ))
-                else:
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    )
-                
+                await _step_with_retry(result.env, actions, log_info, f"round {round_num + 1}")
+            except Exception as step_err:  # noqa: BLE001
+                # Do NOT report a truncated run as complete: the backend must
+                # see this as a failure rather than build a report on it.
+                return fail(f"env.step failed at round {round_num + 1}: {step_err}")
+        
+            actual_actions, last_rowid = fetch_new_actions_from_db(db_path, last_rowid, agent_names)
+            for action_data in actual_actions:
                 if action_logger:
                     action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
-                        action_args={"content": content}
+                        round_num=round_num + 1,
+                        agent_id=action_data['agent_id'],
+                        agent_name=action_data['agent_name'],
+                        action_type=action_data['action_type'],
+                        action_args=action_data['action_args']
                     )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"Published {len(initial_actions)} initial posts")
-    
-    # Log round 0 end
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
-    
-    # Main simulation loop
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get("total_simulation_hours", 72)
-    minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-    
-    # If max rounds is specified, truncate
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
-    start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
-        # Check if shutdown signal received
-        if _shutdown_event and _shutdown_event.is_set():
-            if main_logger:
-                main_logger.info(f"Received shutdown signal, stopping simulation at round {round_num + 1}")
-            break
-        
-        simulated_minutes = round_num * minutes_per_round
-        simulated_hour = (simulated_minutes // 60) % 24
-        simulated_day = simulated_minutes // (60 * 24) + 1
-        
-        active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
-        )
-        
-        # Log round start regardless of whether there are active agents
-        if action_logger:
-            action_logger.log_round_start(round_num + 1, simulated_hour)
-        
-        if not active_agents:
-            # Log round end even when there are no active agents (actions_count=0)
-            if action_logger:
-                action_logger.log_round_end(round_num + 1, 0)
-            continue
-        
-        actions = {agent: LLMAction() for _, agent in active_agents}
-        try:
-            await result.env.step(actions)
-        except Exception as step_err:
-            # A transient LLM/network error in a single round must not abort the
-            # whole process (which would skip log_simulation_end and leave the
-            # environment un-closed). End the loop gracefully so completion is
-            # still logged and the env stays available for interviews.
-            log_info(f"env.step failed at round {round_num + 1}: {step_err}; ending simulation early")
-            break
-
-        # Fetch actually executed actions from database and log them
-        actual_actions, last_rowid = fetch_new_actions_from_db(
-            db_path, last_rowid, agent_names
-        )
-        
-        round_action_count = 0
-        for action_data in actual_actions:
-            if action_logger:
-                action_logger.log_action(
-                    round_num=round_num + 1,
-                    agent_id=action_data['agent_id'],
-                    agent_name=action_data['agent_name'],
-                    action_type=action_data['action_type'],
-                    action_args=action_data['action_args']
-                )
                 total_actions += 1
                 round_action_count += 1
         
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
+        result.rounds_completed = round_num + 1
         
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
     
-    # Note: Do not close the environment, keep it available for interviews
-    
+    # Note: the environment stays open so it can serve interviews
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+    result.outcome = "completed"
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"Simulation loop completed! Elapsed: {elapsed:.1f}s, total actions: {total_actions}")
-    
     return result
 
 
-async def main():
+async def run_twitter_simulation(config, simulation_dir, action_logger=None, main_logger=None, max_rounds=None):
+    return await run_platform_simulation("twitter", config, simulation_dir, action_logger, main_logger, max_rounds)
+
+
+async def run_reddit_simulation(config, simulation_dir, action_logger=None, main_logger=None, max_rounds=None):
+    return await run_platform_simulation("reddit", config, simulation_dir, action_logger, main_logger, max_rounds)
+
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_BAD_ARGS = 2
+EXIT_STOPPED = 143  # 128 + SIGTERM: interrupted by a shutdown signal
+
+# Seconds the finished environment waits for interview commands before it shuts
+# itself down (0 disables the timeout). Keeps a completed simulation from holding
+# a process, its DB handles and LLM clients forever.
+INTERVIEW_IDLE_TIMEOUT = float(os.environ.get("SIMSEND_INTERVIEW_IDLE_TIMEOUT", "1800"))
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='OASIS dual-platform parallel simulation')
     parser.add_argument(
         '--config', 
@@ -1620,12 +1484,13 @@ async def main():
         required=True,
         help='Configuration file path (simulation_config.json)'
     )
-    parser.add_argument(
+    platform_group = parser.add_mutually_exclusive_group()
+    platform_group.add_argument(
         '--twitter-only',
         action='store_true',
         help='Run Twitter simulation only'
     )
-    parser.add_argument(
+    platform_group.add_argument(
         '--reddit-only',
         action='store_true',
         help='Run Reddit simulation only'
@@ -1642,8 +1507,20 @@ async def main():
         default=False,
         help='Close environment immediately after simulation, do not enter command waiting mode'
     )
+    return parser.parse_args(argv)
     
-    args = parser.parse_args()
+
+def summarize_exit_code(results: List[PlatformSimulation], shutdown_requested: bool) -> int:
+    """Map platform outcomes to the process exit code the backend relies on."""
+    if any(r.outcome == "failed" for r in results):
+        return EXIT_FAILED
+    if shutdown_requested or any(r.outcome == "stopped" for r in results):
+        return EXIT_STOPPED
+    return EXIT_OK
+
+
+async def main(argv=None) -> int:
+    args = parse_args(argv)
     
     # Create shutdown event at the start of main, ensuring the entire program can respond to shutdown signals
     global _shutdown_event
@@ -1651,89 +1528,75 @@ async def main():
     
     if not os.path.exists(args.config):
         print(f"Error: Configuration file not found: {args.config}")
-        sys.exit(1)
+        return EXIT_BAD_ARGS
     
     config = load_config(args.config)
     simulation_dir = os.path.dirname(args.config) or "."
     wait_for_commands = not args.no_wait
     
+    if args.twitter_only:
+        platforms = ["twitter"]
+    elif args.reddit_only:
+        platforms = ["reddit"]
+    else:
+        platforms = ["twitter", "reddit"]
+
     # Initialize logging configuration (disable OASIS logs, clean up old files)
     init_logging_for_simulation(simulation_dir)
     
-    # Create log manager
     log_manager = SimulationLogManager(simulation_dir)
-    twitter_logger = log_manager.get_twitter_logger()
-    reddit_logger = log_manager.get_reddit_logger()
+    platform_loggers = {
+        "twitter": log_manager.get_twitter_logger,
+        "reddit": log_manager.get_reddit_logger,
+    }
     
+    total_rounds = compute_total_rounds(config, args.max_rounds)
+    time_config = config.get("time_config", {})
     log_manager.info("=" * 60)
-    log_manager.info("OASIS Dual-Platform Parallel Simulation")
+    log_manager.info(f"OASIS simulation ({' + '.join(platforms)})")
     log_manager.info(f"Config file: {args.config}")
     log_manager.info(f"Simulation ID: {config.get('simulation_id', 'unknown')}")
     log_manager.info(f"Command waiting mode: {'enabled' if wait_for_commands else 'disabled'}")
-    log_manager.info("=" * 60)
-    
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get('total_simulation_hours', 72)
-    minutes_per_round = time_config.get('minutes_per_round', 30)
-    config_total_rounds = (total_hours * 60) // minutes_per_round
-    
-    log_manager.info(f"Simulation parameters:")
-    log_manager.info(f"  - Total simulation duration: {total_hours} hours")
-    log_manager.info(f"  - Time per round: {minutes_per_round} minutes")
-    log_manager.info(f"  - Configured total rounds: {config_total_rounds}")
-    if args.max_rounds:
-        log_manager.info(f"  - Max rounds limit: {args.max_rounds}")
-        if args.max_rounds < config_total_rounds:
-            log_manager.info(f"  - Actual execution rounds: {args.max_rounds} (truncated)")
+    log_manager.info(f"  - Total simulation duration: {time_config.get('total_simulation_hours', 72)} hours")
+    log_manager.info(f"  - Time per round: {time_config.get('minutes_per_round', 30)} minutes")
+    log_manager.info(f"  - Rounds to execute: {total_rounds}")
     log_manager.info(f"  - Agent count: {len(config.get('agent_configs', []))}")
-    
-    log_manager.info("Log structure:")
-    log_manager.info(f"  - Main log: simulation.log")
-    log_manager.info(f"  - Twitter actions: twitter/actions.jsonl")
-    log_manager.info(f"  - Reddit actions: reddit/actions.jsonl")
     log_manager.info("=" * 60)
     
     start_time = datetime.now()
     
-    # Store simulation results from both platforms
-    twitter_result: Optional[PlatformSimulation] = None
-    reddit_result: Optional[PlatformSimulation] = None
+    # return_exceptions=True so one platform raising doesn't cancel the sibling.
+    raw_results = await asyncio.gather(
+        *(run_platform_simulation(p, config, simulation_dir, platform_loggers[p](), log_manager, args.max_rounds)
+          for p in platforms),
+        return_exceptions=True,
+    )
+    results: List[PlatformSimulation] = []
+    for platform, res in zip(platforms, raw_results):
+        if isinstance(res, BaseException):
+            # run_platform_simulation logs its own failures; this is a bug path.
+            log_manager.error(f"{platform} simulation crashed: {res}")
+            crashed = PlatformSimulation(platform)
+            crashed.error = str(res)
+            platform_loggers[platform]().log_simulation_failed(0, total_rounds, 0, f"Crashed: {res}")
+            res = crashed
+        results.append(res)
     
-    if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
-    elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
-    else:
-        # Run in parallel (each platform uses its own logger).
-        # return_exceptions=True so one platform raising doesn't cancel the
-        # sibling and abort the whole run (which would skip command-wait mode
-        # and env cleanup). A failed platform comes back as an exception.
-        results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
-            return_exceptions=True,
-        )
-        twitter_result, reddit_result = results
-        if isinstance(twitter_result, BaseException):
-            log_manager.error(f"Twitter simulation failed: {twitter_result}")
-            twitter_result = None
-        if isinstance(reddit_result, BaseException):
-            log_manager.error(f"Reddit simulation failed: {reddit_result}")
-            reddit_result = None
-    
+    by_platform = {r.platform: r for r in results}
     total_elapsed = (datetime.now() - start_time).total_seconds()
     log_manager.info("=" * 60)
-    log_manager.info(f"Simulation loop completed! Total elapsed: {total_elapsed:.1f}s")
+    for r in results:
+        log_manager.info(f"[{r.platform}] outcome={r.outcome} rounds={r.rounds_completed}/{total_rounds} "
+                         f"actions={r.total_actions}" + (f" error={r.error}" if r.error else ""))
+    log_manager.info(f"Simulation loop finished. Total elapsed: {total_elapsed:.1f}s")
     
-    # Whether to enter command waiting mode
-    if wait_for_commands:
-        log_manager.info("")
-        log_manager.info("=" * 60)
-        log_manager.info("Entering command waiting mode - environment stays running")
-        log_manager.info("Supported commands: interview, batch_interview, close_env")
-        log_manager.info("=" * 60)
+    exit_code = summarize_exit_code(results, _shutdown_event.is_set())
         
-        # Create IPC handler
+    # Only a fully successful run serves interviews; a failed or interrupted run
+    # exits so the backend can report it.
+    if wait_for_commands and exit_code == EXIT_OK:
+        twitter_result = by_platform.get("twitter")
+        reddit_result = by_platform.get("reddit")
         ipc_handler = ParallelIPCHandler(
             simulation_dir=simulation_dir,
             twitter_env=twitter_result.env if twitter_result else None,
@@ -1741,57 +1604,55 @@ async def main():
             reddit_env=reddit_result.env if reddit_result else None,
             reddit_agent_graph=reddit_result.agent_graph if reddit_result else None
         )
+        log_manager.info("Entering command waiting mode - environment stays running")
+        log_manager.info("Supported commands: interview, batch_interview, close_env")
+        if INTERVIEW_IDLE_TIMEOUT > 0:
+            log_manager.info(f"Environment closes after {INTERVIEW_IDLE_TIMEOUT:.0f}s without commands")
         ipc_handler.update_status("alive")
         
-        # Command waiting loop (using global _shutdown_event)
+        last_activity = time.monotonic()
         try:
             while not _shutdown_event.is_set():
-                should_continue = await ipc_handler.process_commands()
+                handled, should_continue = await ipc_handler.process_commands()
                 if not should_continue:
                     break
-                # Use wait_for instead of sleep, so it can respond to shutdown_event
+                if handled:
+                    last_activity = time.monotonic()
+                elif INTERVIEW_IDLE_TIMEOUT > 0 and time.monotonic() - last_activity > INTERVIEW_IDLE_TIMEOUT:
+                    log_manager.info("Interview idle timeout reached, closing environment")
+                    break
                 try:
                     await asyncio.wait_for(_shutdown_event.wait(), timeout=0.5)
                     break  # Received shutdown signal
                 except asyncio.TimeoutError:
-                    pass  # Timeout, continue loop
-        except KeyboardInterrupt:
-            print("\nReceived interrupt signal")
+                    pass
         except asyncio.CancelledError:
             print("\nTask cancelled")
-        except Exception as e:
-            print(f"\nCommand processing error: {e}")
+        except Exception as e:  # noqa: BLE001
+            log_manager.error(f"Command processing error: {e}")
         
-        log_manager.info("\nShutting down environment...")
+        log_manager.info("Shutting down environment...")
         ipc_handler.update_status("stopped")
     
-    # Close environments
-    if twitter_result and twitter_result.env:
-        await twitter_result.env.close()
-        log_manager.info("[Twitter] Environment closed")
+    for r in results:
+        if r.env:
+            try:
+                await r.env.close()
+                log_manager.info(f"[{r.platform}] Environment closed")
+            except Exception as e:  # noqa: BLE001
+                log_manager.warning(f"[{r.platform}] Failed to close environment: {e}")
     
-    if reddit_result and reddit_result.env:
-        await reddit_result.env.close()
-        log_manager.info("[Reddit] Environment closed")
-    
-    log_manager.info("=" * 60)
-    log_manager.info(f"All done!")
-    log_manager.info(f"Log files:")
-    log_manager.info(f"  - {os.path.join(simulation_dir, 'simulation.log')}")
-    log_manager.info(f"  - {os.path.join(simulation_dir, 'twitter', 'actions.jsonl')}")
-    log_manager.info(f"  - {os.path.join(simulation_dir, 'reddit', 'actions.jsonl')}")
-    log_manager.info("=" * 60)
+    log_manager.info(f"All done (exit code {exit_code})")
+    return exit_code
 
 
-def setup_signal_handlers(loop=None):
+def setup_signal_handlers():
     """
     Set up signal handlers to ensure proper exit on SIGTERM/SIGINT
 
-    Persistent simulation scenario: after simulation completes, do not exit, wait for interview commands.
-    When a termination signal is received:
-    1. Notify the asyncio loop to exit the wait
-    2. Give the program a chance to clean up resources (close database, environment, etc.)
-    3. Then exit
+    The handler only sets a flag; the asyncio loop notices it, logs a
+    simulation_stopped event, closes the environments and exits with
+    EXIT_STOPPED. A second signal forces an immediate exit.
     """
     def signal_handler(signum, frame):
         global _cleanup_done
@@ -1800,28 +1661,24 @@ def setup_signal_handlers(loop=None):
         
         if not _cleanup_done:
             _cleanup_done = True
-            # Set event to notify asyncio loop to exit (give loop a chance to clean up resources)
             if _shutdown_event:
                 _shutdown_event.set()
-        
-        # Do not call sys.exit() directly, let the asyncio loop exit normally and clean up resources
-        # Only force exit if the signal is received again
         else:
             print("Force exiting...")
-            sys.exit(1)
+            os._exit(EXIT_STOPPED)
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
 
-if __name__ == "__main__":
+def run_cli(argv=None) -> int:
     setup_signal_handlers()
+    exit_code = EXIT_FAILED
     try:
-        asyncio.run(main())
+        exit_code = asyncio.run(main(argv))
     except KeyboardInterrupt:
         print("\nProgram interrupted")
-    except SystemExit:
-        pass
+        exit_code = EXIT_STOPPED
     finally:
         # Clean up multiprocessing resource tracker (prevent warnings on exit)
         try:
@@ -1830,3 +1687,8 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("Simulation process exited")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(run_cli())

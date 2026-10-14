@@ -20,6 +20,8 @@ from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.json_repair import repair_truncated_json
+from ..utils.retry import call_with_retry, is_transient_error
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -179,6 +181,10 @@ class OasisProfileGenerator:
         "institution", "group", "community"
     ]
     
+    LLM_TIMEOUT_SECONDS = 120.0
+    ZEP_SEARCH_TIMEOUT_SECONDS = 30.0
+    MAX_PARALLEL_PROFILES = 20
+
     def __init__(
         self, 
         api_key: Optional[str] = None,
@@ -194,9 +200,13 @@ class OasisProfileGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
         
+        # Explicit timeout, and no SDK-level retries: _generate_profile_with_llm
+        # already retries, so stacking both multiplies a hung call.
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=self.LLM_TIMEOUT_SECONDS,
+            max_retries=0,
         )
         
         # Zep client for enriched context retrieval
@@ -326,65 +336,35 @@ class OasisProfileGenerator:
 
         comprehensive_query = f"All information about {entity_name}: activities, events, relationships, background, and market behavior"
         
-        def search_edges():
-            """Search edges (facts/relationships) - with retry"""
-            max_retries = 3
-            last_exception = None
-            delay = 2.0
-            
-            for attempt in range(max_retries):
-                try:
-                    return self.zep_client.graph.search(
-                        query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=30,
-                        scope="edges",
-                        reranker="rrf"
-                    )
-                except Exception as e:
-                    last_exception = e
-                    if attempt < max_retries - 1:
-                        logger.debug(f"Zep edge search attempt {attempt + 1} failed: {str(e)[:80]}, retrying...")
-                        time.sleep(delay)
-                        delay *= 2
-                    else:
-                        logger.debug(f"Zep edge search failed after {max_retries} attempts: {e}")
-            return None
-
-        def search_nodes():
-            """Search nodes (entity summaries) - with retry"""
-            max_retries = 3
-            last_exception = None
-            delay = 2.0
-            
-            for attempt in range(max_retries):
-                try:
-                    return self.zep_client.graph.search(
-                        query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=20,
-                        scope="nodes",
-                        reranker="rrf"
-                    )
-                except Exception as e:
-                    last_exception = e
-                    if attempt < max_retries - 1:
-                        logger.debug(f"Zep node search attempt {attempt + 1} failed: {str(e)[:80]}, retrying...")
-                        time.sleep(delay)
-                        delay *= 2
-                    else:
-                        logger.debug(f"Zep node search failed after {max_retries} attempts: {e}")
-            return None
+        def search(scope: str, limit: int):
+            try:
+                return call_with_retry(
+                    self.zep_client.graph.search,
+                    query=comprehensive_query,
+                    graph_id=self.graph_id,
+                    limit=limit,
+                    scope=scope,
+                    reranker="rrf",
+                    max_retries=2,
+                    initial_delay=2.0,
+                    description=f"Zep {scope} search",
+                )
+            except Exception as e:  # noqa: BLE001 - context enrichment is best-effort
+                logger.debug(f"Zep {scope} search failed: {e}")
+                return None
         
         try:
-            # Execute edges and nodes search in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                edge_future = executor.submit(search_edges)
-                node_future = executor.submit(search_nodes)
-
-                # Get results
-                edge_result = edge_future.result(timeout=30)
-                node_result = node_future.result(timeout=30)
+            # Execute edges and nodes search in parallel. Not a `with` block:
+            # its implicit shutdown(wait=True) would block past the timeout.
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            try:
+                edge_future = executor.submit(search, "edges", 30)
+                node_future = executor.submit(search, "nodes", 20)
+                deadline = time.monotonic() + self.ZEP_SEARCH_TIMEOUT_SECONDS
+                edge_result = edge_future.result(timeout=self.ZEP_SEARCH_TIMEOUT_SECONDS)
+                node_result = node_future.result(timeout=max(0.0, deadline - time.monotonic()))
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # Process edge search results
             all_facts = set()
@@ -548,13 +528,13 @@ class OasisProfileGenerator:
                     # No max_tokens set, let LLM generate freely
                 )
 
-                content = response.choices[0].message.content
+                content = response.choices[0].message.content or ""
 
                 # Check if truncated (finish_reason is not 'stop')
                 finish_reason = response.choices[0].finish_reason
                 if finish_reason == 'length':
                     logger.warning(f"LLM output truncated (attempt {attempt+1}), attempting fix...")
-                    content = self._fix_truncated_json(content)
+                    content = repair_truncated_json(content)
 
                 # Try to parse JSON
                 try:
@@ -582,42 +562,21 @@ class OasisProfileGenerator:
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
-                time.sleep(1 * (attempt + 1))  # Exponential backoff
+                if not is_transient_error(e):
+                    break  # auth/config/bad-request errors won't fix themselves
+                time.sleep(1 * (attempt + 1))
 
         logger.warning(f"LLM persona generation failed ({max_attempts} attempts): {last_error}, using rule-based generation")
         return self._generate_profile_rule_based(
             entity_name, entity_type, entity_summary, entity_attributes
         )
     
-    def _fix_truncated_json(self, content: str) -> str:
-        """Fix truncated JSON (output truncated by max_tokens limit)"""
-        import re
-        
-        # If JSON is truncated, try to close it
-        content = content.strip()
-
-        # Count unclosed brackets
-        open_braces = content.count('{') - content.count('}')
-        open_brackets = content.count('[') - content.count(']')
-
-        # Check for unclosed strings
-        if content and content[-1] not in '",}]':
-            # Try to close string
-            content += '"'
-
-        # Close brackets
-        content += ']' * open_brackets
-        content += '}' * open_braces
-        
-        return content
-    
     def _try_fix_json(self, content: str, entity_name: str, entity_type: str, entity_summary: str = "") -> Dict[str, Any]:
         """Try to fix corrupted JSON"""
         import re
         
         # 1. First try to fix truncation
-        content = self._fix_truncated_json(content)
+        content = repair_truncated_json(content)
         
         # 2. Try to extract JSON portion
         json_match = re.search(r'\{[\s\S]*\}', content)
@@ -1023,6 +982,13 @@ Important:
                 )
                 return idx, fallback_profile, str(e)
         
+        # Clamp: the value comes from the API request and sizes a thread pool
+        try:
+            parallel_count = int(parallel_count)
+        except (TypeError, ValueError):
+            parallel_count = 5
+        parallel_count = max(1, min(parallel_count, self.MAX_PARALLEL_PROFILES))
+
         logger.info(f"Starting parallel generation of {total} Agent personas (parallel: {parallel_count})...")
         print(f"\n{'='*60}")
         print(f"Generating Agent Personas - {total} entities, parallel: {parallel_count}")
