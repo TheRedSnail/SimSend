@@ -15,6 +15,7 @@ import time
 import re
 import logging
 import threading
+from collections import Counter, defaultdict
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -577,6 +578,169 @@ Process:
 
 [Important] Requires OASIS simulation environment to be running!"""
 
+TOOL_DESC_SIMULATION_ACTIVITY = """\
+[Simulation Activity - Authoritative Action Record]
+Reads the simulation's own action log: every post, comment, quote, repost, like,
+follow and search, with the agent, platform, round and post text.
+
+[Use Cases]
+- Check what a specific agent actually posted or did (e.g. did the influencer post?)
+- Get exact post text to quote
+- Verify a claim from graph facts or interviews before reporting it
+
+[Returns]
+- Matching actions in chronological order (round 0 = opening posts)"""
+
+# ── Evidence rules and simulation coverage ──
+# Interview answers are role-play: agents happily "remember" days the simulation
+# never ran. These rules plus the coverage block keep the report to what was
+# actually observed.
+
+EVIDENCE_RULES = """\
+[Evidence Rules - Must Follow]
+1. Observed behaviour means the actions returned by simulation_activity (the authoritative record of who posted, liked, reposted or followed what) and graph facts returned by insight_forge, panorama_search and quick_search. Only observed behaviour may be described as something that happened in the simulation. Graph facts are summaries and can miss posts: before claiming that someone did not post or act, check simulation_activity and [Simulation Coverage]. If any source contradicts simulation_activity, trust simulation_activity.
+2. Interview answers (interview_agents) are agents' stated opinions, expectations and recollections, not observed events. Attribute them explicitly (e.g. "In an interview, the brand account said..."). If an interviewee describes an event that does not appear in observed behaviour, do not report it as having happened: leave it out, or present it clearly as that agent's claim or expectation.
+3. Stay within the simulated window described under [Simulation Coverage]. Do not narrate specific days, dates or events beyond it. If the window is shorter than the campaign, say so, and label anything about the later period as a projection.
+4. Never invent numbers. Percentages, counts and shares must come directly from tool results or [Simulation Coverage]; otherwise describe magnitude in words."""
+
+
+def _format_hours(hours: float) -> str:
+    if hours >= 48:
+        return f"{hours / 24:g} days ({hours:g} hours)"
+    return f"{hours:g} hours"
+
+
+def describe_simulation_coverage(simulation_id: str) -> str:
+    """Describe how much of the campaign window the simulation actually ran."""
+    from .simulation_runner import SimulationRunner
+
+    try:
+        state = SimulationRunner.get_run_state(simulation_id)
+    except Exception as e:  # noqa: BLE001 - coverage is advisory, never fatal
+        logger.warning(f"Could not load run state for {simulation_id}: {e}")
+        state = None
+
+    if state is None:
+        return (
+            "[Simulation Coverage]\n"
+            "- Unknown: no run record was found. Do not narrate a day-by-day timeline."
+        )
+
+    minutes_per_round = 60
+    config_path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "simulation_config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            time_config = json.load(f).get("time_config", {})
+        minutes_per_round = max(int(time_config.get("minutes_per_round") or 60), 1)
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning(f"Could not read time config for {simulation_id}: {e}")
+
+    actions = load_simulation_actions(simulation_id)
+    simulated_hours = state.current_round * minutes_per_round / 60
+    campaign_hours = state.total_simulation_hours or 0
+
+    window = f"{_format_hours(simulated_hours)} of campaign time ({state.current_round} rounds of {minutes_per_round} min)"
+    if campaign_hours:
+        window += f", out of a {_format_hours(campaign_hours)} campaign window"
+    lines = [
+        "[Simulation Coverage - what was actually simulated]",
+        f"- Simulated: {window}",
+        f"- Recorded agent actions: {state.twitter_actions_count} on Twitter, {state.reddit_actions_count} on Reddit",
+        f"- Run status: {state.runner_status.value}",
+    ]
+    if campaign_hours and simulated_hours < campaign_hours:
+        lines.append(
+            f"- Only the first {_format_hours(simulated_hours)} of the campaign were simulated. "
+            "Nothing after that was observed; any statement about the later period is a projection "
+            "and must be labelled as one."
+        )
+    if actions:
+        lines.append(
+            "- Recorded actions per agent, per platform (agents not listed took no recorded action):"
+        )
+        lines.append(summarize_agent_activity(actions))
+    return "\n".join(lines)
+
+
+def load_simulation_actions(simulation_id: str) -> List[Dict[str, Any]]:
+    """Agent actions from the platform action logs, oldest first, tagged with their platform."""
+    actions = []
+    for platform in ("twitter", "reddit"):
+        path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, platform, "actions.jsonl")
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(entry, dict) and "action_type" in entry:
+                        entry["platform"] = platform
+                        actions.append(entry)
+        except OSError:
+            continue
+    actions.sort(key=lambda a: (a.get("round", 0), a.get("timestamp", "")))
+    return actions
+
+
+# Plain-language meaning of OASIS action types. Raw names mislead the model,
+# e.g. TREND reads like "this post trended" but means "looked at the trending feed".
+ACTION_LABELS = {
+    "CREATE_POST": "posts",
+    "CREATE_COMMENT": "comments",
+    "QUOTE_POST": "quote posts",
+    "REPOST": "reposts",
+    "LIKE_POST": "post likes",
+    "DISLIKE_POST": "post dislikes",
+    "LIKE_COMMENT": "comment likes",
+    "DISLIKE_COMMENT": "comment dislikes",
+    "FOLLOW": "follows",
+    "MUTE": "mutes",
+    "SEARCH_POSTS": "post searches (looked something up)",
+    "SEARCH_USER": "user searches (looked someone up)",
+    "TREND": "trending-feed views (looked at what is trending; not evidence that their own post trended)",
+    "REFRESH": "feed refreshes",
+    "DO_NOTHING": "idle turns",
+}
+
+
+def summarize_agent_activity(actions: List[Dict[str, Any]]) -> str:
+    per_agent: Dict[str, Dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+    for action in actions:
+        per_agent[action.get("agent_name") or "?"][action["platform"]][action["action_type"]] += 1
+    lines = []
+    for name, platforms in sorted(per_agent.items()):
+        parts = [
+            f"{platform}: " + ", ".join(
+                f"{count} {ACTION_LABELS.get(kind, kind)}" for kind, count in counts.most_common()
+            )
+            for platform, counts in sorted(platforms.items())
+        ]
+        lines.append(f"  - {name} — " + "; ".join(parts))
+    return "\n".join(lines)
+
+
+def format_action(action: Dict[str, Any]) -> str:
+    args = action.get("action_args") or {}
+    text = args.get("content") or args.get("quote_content")
+    target = args.get("post_author_name") or args.get("original_author_name") or args.get("target_user_name")
+    original = args.get("post_content") or args.get("original_content")
+
+    kind = action["action_type"]
+    line = f"[{action['platform']}, round {action.get('round', '?')}] {action.get('agent_name', '?')} {kind}"
+    if kind in ACTION_LABELS:
+        line += f" ({ACTION_LABELS[kind]})"
+    if target:
+        line += f" (target: {target})"
+    if text:
+        line += f': "{str(text)[:300]}"'
+    if original:
+        line += f' | on post: "{str(original)[:150]}"'
+    if args.get("query"):
+        line += f' | query: "{args["query"]}"'
+    return line
+
+
 # ── Outline planning prompt ──
 
 PLAN_SYSTEM_PROMPT = """\
@@ -590,7 +754,7 @@ Write a "Campaign Effectiveness Prediction Report" answering:
 1. How did target audience segments react to the campaign?
 2. What consumer behavior patterns and sentiment dynamics emerged?
 3. What opportunities, risks, and strategic insights does this simulation reveal?
-4. What is the predicted sentiment trajectory over the campaign period?
+4. How did sentiment develop over the simulated period?
 
 [Report Positioning]
 - This is a simulation-based campaign effectiveness prediction report
@@ -623,6 +787,10 @@ PLAN_USER_PROMPT_TEMPLATE = """\
 [Campaign Brief]
 Campaign requirement injected into the simulation: {simulation_requirement}
 
+{simulation_coverage}
+
+{evidence_rules}
+
 [Simulation Scale]
 - Number of entities in simulation: {total_nodes}
 - Number of relationships between entities: {total_edges}
@@ -649,6 +817,8 @@ You are a Marketing Campaign Effectiveness Prediction Report expert, writing a s
 Report title: {report_title}
 Report summary: {report_summary}
 Campaign brief (simulation requirement): {simulation_requirement}
+
+{simulation_coverage}
 
 Current section to write: {section_title}
 
@@ -678,10 +848,12 @@ Your task is to:
    - Each section must call tools at least 3 times (max 5) to observe consumer reaction data
 
 2. [Must Quote Agent Original Statements]
-   - Agent statements and behaviors predict real consumer reactions
-   - Use quotation format in the report to present these predictions, e.g.:
-     > "Consumer segment X would respond: original content..."
-   - These quotes are core evidence of the campaign effectiveness prediction
+   - Agent posts, comments and statements predict real consumer reactions
+   - Quote them, and make clear whether each quote is a post/comment made in
+     the simulation or an interview answer, e.g.:
+     > "Original post content..." (post by Consumer segment X)
+   - Posts and comments are the core evidence; interview answers add the
+     agents' reasoning (see the Evidence Rules below)
 
 3. [Language Consistency]
    - Tool results may contain mixed language content
@@ -693,6 +865,8 @@ Your task is to:
    - Report content must reflect simulation results that represent predicted consumer reactions
    - Do not add information not present in the simulation
    - If information is insufficient in some area, state this honestly
+
+{evidence_rules}
 
 ═══════════════════════════════════════════════════════════════
 [Format Rules - Extremely Important!]
@@ -707,21 +881,20 @@ Your task is to:
 
 [Correct Example]
 ```
-This section analyzes consumer sentiment dynamics. Through deep analysis of simulation data, we found...
+<opening paragraph summarizing the section's finding>
 
-**Initial Reaction Phase**
+**<bold label for the first theme>**
 
-Social media served as the first touchpoint for consumer reactions:
+<analysis paragraph based on tool results>
 
-> "68% of initial consumer reactions were concentrated on social media platforms..."
+> "<exact text of a post, comment or interview answer from a tool result>" (<who said it, and whether it was a post or an interview>)
 
-**Sentiment Amplification Phase**
+**<bold label for the second theme>**
 
-Influencer endorsements further amplified campaign reach:
-
-- Strong emotional resonance
-- High shareability among young consumers
+- <point supported by tool results>
+- <point supported by tool results>
 ```
+(Placeholders in <angle brackets> show structure only; never copy example wording into the report.)
 
 [Incorrect Example]
 ```
@@ -743,6 +916,7 @@ This section analyzes...
 - panorama_search: Panoramic search, understand full campaign reaction timeline and evolution
 - quick_search: Quick verification of specific data points
 - interview_agents: Interview simulation Agents, get first-person perspectives from different consumer/brand roles
+- simulation_activity: The exact record of what each agent posted and did; use it for quotes and to verify claims
 
 ═══════════════════════════════════════════════════════════════
 [Workflow]
@@ -781,16 +955,16 @@ Strictly forbidden:
 
    ✅ Correct:
    ```
-   The brand's response was seen as lacking substance.
+   <sentence introducing the quote>
 
-   > "The brand's response pattern appeared rigid and slow in the fast-moving social media environment."
+   > "<exact quoted text from a tool result>"
 
-   This assessment reflects widespread consumer dissatisfaction.
+   <sentence interpreting the quote>
    ```
 
    ❌ Incorrect:
    ```
-   The brand's response was seen as lacking substance. > "The brand's response pattern..." This assessment reflects...
+   <sentence introducing the quote> > "<quoted text>" <sentence interpreting the quote>
    ```
 5. Maintain logical coherence with other sections
 6. [Avoid Repetition] Carefully read completed sections below, do not repeat the same information
@@ -862,6 +1036,8 @@ You are a concise and efficient simulation prediction assistant.
 [Background]
 Campaign brief: {simulation_requirement}
 
+{simulation_coverage}
+
 [Generated Analysis Report]
 {report_content}
 
@@ -870,6 +1046,7 @@ Campaign brief: {simulation_requirement}
 2. Answer directly, avoid lengthy reasoning
 3. Only call tools for more data when the report content is insufficient
 4. Keep answers concise, clear, and well-organized
+5. Do not describe events outside the simulated window above as if they happened, and do not invent numbers
 
 [Available Tools] (use only when needed, max 1-2 calls)
 {tools_description}
@@ -939,6 +1116,9 @@ class ReportAgent:
         # Tool definitions
         self.tools = self._define_tools()
 
+        # What was actually simulated (computed on first use)
+        self._simulation_coverage: Optional[str] = None
+
         # Logger (initialized in generate_report)
         self.report_logger: Optional[ReportLogger] = None
         # Console logger (initialized in generate_report)
@@ -946,6 +1126,12 @@ class ReportAgent:
 
         logger.info(f"ReportAgent initialized: graph_id={graph_id}, simulation_id={simulation_id}")
     
+    @property
+    def simulation_coverage(self) -> str:
+        if self._simulation_coverage is None:
+            self._simulation_coverage = describe_simulation_coverage(self.simulation_id)
+        return self._simulation_coverage
+
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
         """Define available tools"""
         return {
@@ -979,6 +1165,15 @@ class ReportAgent:
                 "parameters": {
                     "interview_topic": "Interview topic or requirement description (e.g., 'Understand consumer reactions to the new product launch')",
                     "max_agents": "Max number of Agents to interview (optional, default 5, max 10)"
+                }
+            },
+            "simulation_activity": {
+                "name": "simulation_activity",
+                "description": TOOL_DESC_SIMULATION_ACTIVITY,
+                "parameters": {
+                    "agent_name": "Only actions by agents whose name contains this text (optional)",
+                    "action_type": "Only this action type, e.g. CREATE_POST, QUOTE_POST, LIKE_POST (optional)",
+                    "limit": "Max actions to return, most recent first kept (optional, default 20, max 50)"
                 }
             }
         }
@@ -1049,7 +1244,10 @@ class ReportAgent:
                     max_agents=max_agents
                 )
                 return result.to_text()
-            
+
+            elif tool_name == "simulation_activity":
+                return self._simulation_activity(parameters)
+
             # ========== Backward-compatible legacy tools (internally redirected) ==========
             
             elif tool_name == "search_graph":
@@ -1092,7 +1290,29 @@ class ReportAgent:
             return f"Tool execution failed: {str(e)}"
     
     # Valid tool names set, used for bare JSON fallback parsing validation
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents", "simulation_activity"}
+
+    def _simulation_activity(self, parameters: Dict[str, Any]) -> str:
+        """Matching entries from the action log (the ground truth of who did what)."""
+        agent = str(parameters.get("agent_name") or "").strip().lower()
+        action_type = str(parameters.get("action_type") or "").strip().upper()
+        try:
+            limit = int(parameters.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(limit, 50))
+
+        matches = [
+            a for a in load_simulation_actions(self.simulation_id)
+            if (not agent or agent in str(a.get("agent_name", "")).lower())
+            and (not action_type or a["action_type"] == action_type)
+        ]
+        header = f"Simulation activity record (authoritative): {len(matches)} matching actions"
+        if not matches:
+            return header + "\nNo matching actions were recorded."
+        if len(matches) > limit:
+            header += f", showing the most recent {limit}"
+        return "\n".join([header] + [format_action(a) for a in matches[-limit:]])
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
@@ -1240,6 +1460,8 @@ class ReportAgent:
         system_prompt = PLAN_SYSTEM_PROMPT
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
+            simulation_coverage=self.simulation_coverage,
+            evidence_rules=EVIDENCE_RULES,
             total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
             total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
             entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
@@ -1330,6 +1552,8 @@ class ReportAgent:
             report_title=outline.title,
             report_summary=outline.summary,
             simulation_requirement=self.simulation_requirement,
+            simulation_coverage=self.simulation_coverage,
+            evidence_rules=EVIDENCE_RULES,
             section_title=section.title,
             tools_description=self._get_tools_description(),
         )
@@ -1357,11 +1581,14 @@ class ReportAgent:
         
         # ReACT loop
         tool_calls_count = 0
-        max_iterations = 5  # Max iteration rounds
+        # Room for the full tool budget, the Final Answer turn, and a couple of
+        # malformed tool calls; at 5 a section using all 5 tools never got to
+        # answer on its own and was always force-finished.
+        max_iterations = self.MAX_TOOL_CALLS_PER_SECTION + 3
         min_tool_calls = 3  # Min required tool calls
         conflict_retries = 0  # Consecutive conflicts where tool call and Final Answer appear together
         used_tools = set()  # Track used tool names
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = set(self.VALID_TOOL_NAMES)
 
         # Report context for InsightForge sub-question generation
         report_context = f"Section title: {section.title}\nSimulation requirement: {self.simulation_requirement}"
@@ -1902,6 +2129,7 @@ class ReportAgent:
         
         system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
+            simulation_coverage=self.simulation_coverage,
             report_content=report_content if report_content else "(No report available yet)",
             tools_description=self._get_tools_description(),
         )

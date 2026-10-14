@@ -1440,7 +1440,10 @@ async def run_platform_simulation(
                 round_action_count += 1
         
         if action_logger:
-            action_logger.log_round_end(round_num + 1, round_action_count)
+            action_logger.log_round_end(
+                round_num + 1, round_action_count,
+                simulated_hours=round((round_num + 1) * minutes_per_round / 60, 2),
+            )
         result.rounds_completed = round_num + 1
         
         if (round_num + 1) % 20 == 0:

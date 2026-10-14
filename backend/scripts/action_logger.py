@@ -77,13 +77,14 @@ class PlatformActionLogger:
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
-    def log_round_end(self, round_num: int, actions_count: int):
-        """Log round end"""
+    def log_round_end(self, round_num: int, actions_count: int, simulated_hours: float = 0):
+        """Log round end. simulated_hours = campaign time elapsed after this round."""
         entry = {
             "round": round_num,
             "timestamp": datetime.now().isoformat(),
             "event_type": "round_end",
             "actions_count": actions_count,
+            "simulated_hours": simulated_hours,
         }
 
         with open(self.log_path, 'a', encoding='utf-8') as f:
