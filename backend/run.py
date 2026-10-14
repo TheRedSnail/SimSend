@@ -22,7 +22,7 @@ from app import create_app
 from app.config import Config
 
 # Module-level WSGI application so a production server can import it, e.g.
-#   waitress-serve --host=0.0.0.0 --port=5001 run:app
+#   waitress-serve --host=127.0.0.1 --port=5001 run:app
 app = create_app()
 
 
@@ -40,7 +40,9 @@ def main():
     # Reuse the module-level application created above.
 
     # Get run configuration
-    host = os.environ.get('FLASK_HOST', '0.0.0.0')
+    # Loopback by default; set FLASK_HOST=0.0.0.0 to expose on the network
+    # (the Docker image does this explicitly).
+    host = Config.FLASK_HOST
     port = int(os.environ.get('FLASK_PORT', 5001))
     debug = Config.DEBUG
 

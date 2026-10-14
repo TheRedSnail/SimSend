@@ -273,7 +273,7 @@
                 <div class="message-text" v-html="renderMarkdown(msg.content)"></div>
               </div>
             </div>
-            <div v-if="isSending" class="chat-message assistant">
+            <div v-if="isSending && sendingThreadKey === currentThreadKey" class="chat-message assistant">
               <div class="message-avatar">
                 <span>{{ chatTarget === 'report_agent' ? 'R' : (selectedAgent?.username?.[0] || 'A') }}</span>
               </div>
@@ -414,6 +414,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { chatWithReport, getReport, getAgentLog } from '../api/report'
 import { interviewAgents, getSimulationProfilesRealtime } from '../api/simulation'
+import { renderMarkdown } from '../utils/markdown'
 
 const props = defineProps({
   reportId: String,
@@ -433,9 +434,10 @@ const showToolsDetail = ref(true)
 
 // Chat State
 const chatInput = ref('')
-const chatHistory = ref([])
-const chatHistoryCache = ref({}) // Cache all chat records: { 'report_agent': [], 'agent_0': [], 'agent_1': [], ... }
+const chatHistoryCache = ref({ report_agent: [] }) // All chat threads: { 'report_agent': [], 'agent_0': [], ... }
+const chatHistory = ref(chatHistoryCache.value.report_agent) // Thread shown for the current target
 const isSending = ref(false)
+const sendingThreadKey = ref(null) // Thread awaiting a reply
 const chatMessages = ref(null)
 const chatInputRef = ref(null)
 
@@ -477,28 +479,25 @@ const toggleSectionCollapse = (idx) => {
   collapsedSections.value = newSet
 }
 
-const selectChatTarget = (target) => {
-  chatTarget.value = target
-  if (target === 'report_agent') {
-    showAgentDropdown.value = false
-  }
+// Chat threads are stored by reference in chatHistoryCache; chatHistory always
+// points at the thread for the current target. A reply is appended to the
+// thread captured when the message was sent, so switching targets mid-request
+// can't put agent A's answer into agent B's conversation.
+const threadKeyFor = (target, agentIndex) => {
+  if (target === 'report_agent') return 'report_agent'
+  return agentIndex !== null && agentIndex !== undefined ? `agent_${agentIndex}` : null
 }
 
-// Save current chat history to cache
-const saveChatHistory = () => {
-  if (chatHistory.value.length === 0) return
-  
-  if (chatTarget.value === 'report_agent') {
-    chatHistoryCache.value['report_agent'] = [...chatHistory.value]
-  } else if (selectedAgentIndex.value !== null) {
-    chatHistoryCache.value[`agent_${selectedAgentIndex.value}`] = [...chatHistory.value]
+const getThread = (key) => {
+  if (!chatHistoryCache.value[key]) {
+    chatHistoryCache.value[key] = []
   }
+  return chatHistoryCache.value[key]
 }
+
+const currentThreadKey = computed(() => threadKeyFor(chatTarget.value, selectedAgentIndex.value))
 
 const selectReportAgentChat = () => {
-  // Save current chat history
-  saveChatHistory()
-
   activeTab.value = 'chat'
   chatTarget.value = 'report_agent'
   selectedAgent.value = null
@@ -506,7 +505,7 @@ const selectReportAgentChat = () => {
   showAgentDropdown.value = false
 
   // Restore Report Agent chat history
-  chatHistory.value = chatHistoryCache.value['report_agent'] || []
+  chatHistory.value = getThread('report_agent')
 }
 
 const selectSurveyTab = () => {
@@ -525,25 +524,22 @@ const toggleAgentDropdown = () => {
 }
 
 const selectAgent = (agent, idx) => {
-  // Save current chat history
-  saveChatHistory()
-
   selectedAgent.value = agent
   selectedAgentIndex.value = idx
   chatTarget.value = 'agent'
   showAgentDropdown.value = false
 
   // Restore this agent's chat history
-  chatHistory.value = chatHistoryCache.value[`agent_${idx}`] || []
+  chatHistory.value = getThread(`agent_${idx}`)
   addLog(`Selected conversation target: ${agent.username}`)
 }
 
 const formatTime = (timestamp) => {
   if (!timestamp) return ''
   try {
-    return new Date(timestamp).toLocaleTimeString('en-US', { 
-      hour12: false, 
-      hour: '2-digit', 
+    return new Date(timestamp).toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
       minute: '2-digit'
     })
   } catch {
@@ -551,238 +547,130 @@ const formatTime = (timestamp) => {
   }
 }
 
-const renderMarkdown = (content) => {
-  if (!content) return ''
-
-  // SECURITY: output is injected via v-html and `content` is agent-generated
-  // report/chat text as well as the user's own chat messages — all untrusted.
-  // Escape `&` and `<` so no raw tag (e.g. an <img> with an onerror handler)
-  // can form; markdown markers are unaffected and `>` is left intact for
-  // blockquotes.
-  content = String(content).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-
-  let processedContent = content.replace(/^##\s+.+\n+/, '')
-  let html = processedContent.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
-  html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-  html = html.replace(/^#### (.+)$/gm, '<h5 class="md-h5">$1</h5>')
-  html = html.replace(/^### (.+)$/gm, '<h4 class="md-h4">$1</h4>')
-  html = html.replace(/^## (.+)$/gm, '<h3 class="md-h3">$1</h3>')
-  html = html.replace(/^# (.+)$/gm, '<h2 class="md-h2">$1</h2>')
-  html = html.replace(/^> (.+)$/gm, '<blockquote class="md-quote">$1</blockquote>')
-  
-  // Process lists - supports sub-lists
-  html = html.replace(/^(\s*)- (.+)$/gm, (match, indent, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-li" data-level="${level}">${text}</li>`
-  })
-  html = html.replace(/^(\s*)(\d+)\. (.+)$/gm, (match, indent, num, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-oli" data-level="${level}">${text}</li>`
-  })
-  
-  // Wrap unordered lists
-  html = html.replace(/(<li class="md-li"[^>]*>.*?<\/li>\s*)+/g, '<ul class="md-ul">$&</ul>')
-  // Wrap ordered lists
-  html = html.replace(/(<li class="md-oli"[^>]*>.*?<\/li>\s*)+/g, '<ol class="md-ol">$&</ol>')
-  
-  // Clean all whitespace between list items
-  html = html.replace(/<\/li>\s+<li/g, '</li><li')
-  // Clean whitespace after list opening tags
-  html = html.replace(/<ul class="md-ul">\s+/g, '<ul class="md-ul">')
-  html = html.replace(/<ol class="md-ol">\s+/g, '<ol class="md-ol">')
-  // Clean whitespace before list closing tags
-  html = html.replace(/\s+<\/ul>/g, '</ul>')
-  html = html.replace(/\s+<\/ol>/g, '</ol>')
-  
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>')
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>')
-  html = html.replace(/^---$/gm, '<hr class="md-hr">')
-  html = html.replace(/\n\n/g, '</p><p class="md-p">')
-  html = html.replace(/\n/g, '<br>')
-  html = '<p class="md-p">' + html + '</p>'
-  html = html.replace(/<p class="md-p"><\/p>/g, '')
-  html = html.replace(/<p class="md-p">(<h[2-5])/g, '$1')
-  html = html.replace(/(<\/h[2-5]>)<\/p>/g, '$1')
-  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>)<\/p>/g, '$1')
-  // Clean <br> tags around block-level elements
-  html = html.replace(/<br>\s*(<ul|<ol|<blockquote)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>)\s*<br>/g, '$1')
-  // Clean <p><br> immediately followed by block elements (caused by extra blank lines)
-  html = html.replace(/<p class="md-p">(<br>\s*)+(<ul|<ol|<blockquote|<pre|<hr)/g, '$2')
-  // Clean consecutive <br> tags
-  html = html.replace(/(<br>\s*){2,}/g, '<br>')
-  // Clean <br> between block-level closing tags and paragraph opening tags
-  html = html.replace(/(<\/ol>|<\/ul>|<\/blockquote>)<br>(<p|<div)/g, '$1$2')
-
-  // Fix numbering for non-contiguous ordered lists: maintain incrementing numbers when single-item <ol> blocks are separated by paragraph content
-  const tokens = html.split(/(<ol class="md-ol">(?:<li class="md-oli"[^>]*>[\s\S]*?<\/li>)+<\/ol>)/g)
-  let olCounter = 0
-  let inSequence = false
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].startsWith('<ol class="md-ol">')) {
-      const liCount = (tokens[i].match(/<li class="md-oli"/g) || []).length
-      if (liCount === 1) {
-        olCounter++
-        if (olCounter > 1) {
-          tokens[i] = tokens[i].replace('<ol class="md-ol">', `<ol class="md-ol" start="${olCounter}">`)
-        }
-        inSequence = true
-      } else {
-        olCounter = 0
-        inSequence = false
-      }
-    } else if (inSequence) {
-      if (/<h[2-5]/.test(tokens[i])) {
-        olCounter = 0
-        inSequence = false
-      }
-    }
-  }
-  html = tokens.join('')
-
-  return html
-}
-
 // Chat Methods
 const sendMessage = async () => {
   if (!chatInput.value.trim() || isSending.value) return
-  
+
+  // Capture the conversation target now; the user may switch while we wait.
+  const target = chatTarget.value
+  const agent = selectedAgent.value
+  const agentIndex = selectedAgentIndex.value
+  if (target === 'agent' && (!agent || agentIndex === null)) {
+    addLog('Please select a consumer agent first')
+    return
+  }
+  const key = threadKeyFor(target, agentIndex)
+  const thread = getThread(key)
+
   const message = chatInput.value.trim()
   chatInput.value = ''
-  
+
   // Add user message
-  chatHistory.value.push({
+  thread.push({
     role: 'user',
     content: message,
     timestamp: new Date().toISOString()
   })
-  
+
   scrollToBottom()
   isSending.value = true
-  
+  sendingThreadKey.value = key
+
   try {
-    if (chatTarget.value === 'report_agent') {
-      await sendToReportAgent(message)
+    if (target === 'report_agent') {
+      await sendToReportAgent(message, thread)
     } else {
-      await sendToAgent(message)
+      await sendToAgent(message, thread, agent, agentIndex)
     }
   } catch (err) {
     addLog(`Send failed: ${err.message}`)
-    chatHistory.value.push({
+    thread.push({
       role: 'assistant',
       content: `Sorry, an error occurred: ${err.message}`,
       timestamp: new Date().toISOString()
     })
   } finally {
     isSending.value = false
+    sendingThreadKey.value = null
     scrollToBottom()
-    // Auto-save chat history to cache
-    saveChatHistory()
   }
 }
 
-const sendToReportAgent = async (message) => {
+const sendToReportAgent = async (message, thread) => {
   addLog(`Sending to Report Agent: ${message.substring(0, 50)}...`)
-  
-  // Build chat history for API. Exclude only the just-sent message (the last
-  // matching user turn) — not every earlier turn with identical text, which
-  // would silently drop context when a question like "why?" is repeated.
-  const history = [...chatHistory.value]
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].role === 'user' && history[i].content === message) {
-      history.splice(i, 1)
-      break
-    }
-  }
-  const historyForApi = history
+
+  // Build chat history for API, excluding the just-sent message (the last
+  // turn in the thread).
+  const historyForApi = thread
+    .slice(0, -1)
     .slice(-10) // Keep last 10 messages
     .map(msg => ({
       role: msg.role,
       content: msg.content
     }))
-  
+
   const res = await chatWithReport({
     simulation_id: props.simulationId,
     message: message,
     chat_history: historyForApi
   })
-  
-  if (res.success && res.data) {
-    chatHistory.value.push({
-      role: 'assistant',
-      content: res.data.response || res.data.answer || 'No response',
-      timestamp: new Date().toISOString()
-    })
-    addLog('Report Agent replied')
-  } else {
-    throw new Error(res.error || 'Request failed')
-  }
+
+  thread.push({
+    role: 'assistant',
+    content: res.data?.response || res.data?.answer || 'No response',
+    timestamp: new Date().toISOString()
+  })
+  addLog('Report Agent replied')
 }
 
-const sendToAgent = async (message) => {
-  if (!selectedAgent.value || selectedAgentIndex.value === null) {
-    throw new Error('Please select a consumer agent first')
-  }
-  
-  addLog(`Sending to ${selectedAgent.value.username}: ${message.substring(0, 50)}...`)
-  
-  // Build prompt with chat history
+const sendToAgent = async (message, thread, agent, agentId) => {
+  addLog(`Sending to ${agent.username}: ${message.substring(0, 50)}...`)
+
+  // Build prompt with chat history (everything before the just-sent message)
   let prompt = message
-  if (chatHistory.value.length > 1) {
-    const historyContext = chatHistory.value
-      .filter(msg => msg.content !== message)
+  const previous = thread.slice(0, -1)
+  if (previous.length > 0) {
+    const historyContext = previous
       .slice(-6)
       .map(msg => `${msg.role === 'user' ? 'Interviewer' : 'You'}: ${msg.content}`)
       .join('\n')
     prompt = `Here is our previous conversation:\n${historyContext}\n\nMy new question is: ${message}`
   }
-  
+
   const res = await interviewAgents({
     simulation_id: props.simulationId,
     interviews: [{
-      agent_id: selectedAgentIndex.value,
+      agent_id: agentId,
       prompt: prompt
     }]
   })
-  
-  if (res.success && res.data) {
-    // Data path: res.data.result.results is an object dictionary
-    // Format: {"twitter_0": {...}, "reddit_0": {...}} or single platform {"reddit_0": {...}}
-    const resultData = res.data.result || res.data
-    const resultsDict = resultData.results || resultData
-    
-    // Convert object dictionary to array, prefer reddit platform response
-    let responseContent = null
-    const agentId = selectedAgentIndex.value
-    
-    if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
-      // Prefer reddit platform response, fallback to twitter
-      const redditKey = `reddit_${agentId}`
-      const twitterKey = `twitter_${agentId}`
-      const agentResult = resultsDict[redditKey] || resultsDict[twitterKey] || Object.values(resultsDict)[0]
-      if (agentResult) {
-        responseContent = agentResult.response || agentResult.answer
-      }
-    } else if (Array.isArray(resultsDict) && resultsDict.length > 0) {
-      // Compatible with array format
-      responseContent = resultsDict[0].response || resultsDict[0].answer
+
+  // Data path: res.data.result.results is an object dictionary
+  // Format: {"twitter_0": {...}, "reddit_0": {...}} or single platform {"reddit_0": {...}}
+  const resultData = res.data?.result || res.data || {}
+  const resultsDict = resultData.results || resultData
+
+  let responseContent = null
+  if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
+    // Prefer reddit platform response, fallback to twitter
+    const agentResult = resultsDict[`reddit_${agentId}`] || resultsDict[`twitter_${agentId}`] || Object.values(resultsDict)[0]
+    if (agentResult) {
+      responseContent = agentResult.response || agentResult.answer
     }
-    
-    if (responseContent) {
-      chatHistory.value.push({
-        role: 'assistant',
-        content: responseContent,
-        timestamp: new Date().toISOString()
-      })
-      addLog(`${selectedAgent.value.username} replied`)
-    } else {
-      throw new Error('No response data')
-    }
-  } else {
-    throw new Error(res.error || 'Request failed')
+  } else if (Array.isArray(resultsDict) && resultsDict.length > 0) {
+    // Compatible with array format
+    responseContent = resultsDict[0].response || resultsDict[0].answer
   }
+
+  if (!responseContent) {
+    throw new Error('No response data')
+  }
+  thread.push({
+    role: 'assistant',
+    content: responseContent,
+    timestamp: new Date().toISOString()
+  })
+  addLog(`${agent.username} replied`)
 }
 
 const scrollToBottom = () => {

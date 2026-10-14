@@ -5,32 +5,14 @@ Unified OpenAI-compatible API calls
 
 import json
 import re
-import time
 import logging
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
 from ..config import Config
+from .retry import call_with_retry, is_transient_error
 
 logger = logging.getLogger('mirofish.llm_client')
-
-# Transient errors worth retrying (network blips, rate limits, provider 5xx).
-# Imported defensively so an older/newer openai SDK can't break import.
-try:
-    from openai import (
-        APITimeoutError,
-        RateLimitError,
-        APIConnectionError,
-        InternalServerError,
-    )
-    _TRANSIENT_ERRORS = (
-        APITimeoutError,
-        RateLimitError,
-        APIConnectionError,
-        InternalServerError,
-    )
-except ImportError:  # pragma: no cover - depends on SDK version
-    _TRANSIENT_ERRORS = ()
 
 
 class LLMClient:
@@ -53,10 +35,13 @@ class LLMClient:
         if not self.api_key:
             raise ValueError("LLM_API_KEY is not configured")
 
+        # max_retries=0: chat() owns the retry policy. Leaving the SDK's own two
+        # retries on as well would turn 3 attempts into 9.
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=self.REQUEST_TIMEOUT,
+            max_retries=0,
         )
 
     def chat(
@@ -76,7 +61,8 @@ class LLMClient:
             response_format: Response format (e.g., JSON mode)
 
         Returns:
-            Model response text
+            Model response text. May be '' (content filter, tool-only or empty
+            completion); callers that need content must treat '' as a failure.
         """
         kwargs = {
             "model": self.model,
@@ -88,23 +74,17 @@ class LLMClient:
         if response_format:
             kwargs["response_format"] = response_format
 
-        # Retry transient failures with exponential backoff so a single network
-        # blip or provider 5xx doesn't abort a long pipeline (e.g. discarding a
-        # report that already has completed sections).
-        response = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                break
-            except _TRANSIENT_ERRORS as e:
-                if attempt == self.MAX_RETRIES - 1:
-                    raise
-                delay = 2 ** attempt  # 1s, 2s, 4s
-                logger.warning(
-                    f"LLM call failed ({type(e).__name__}); retry "
-                    f"{attempt + 1}/{self.MAX_RETRIES - 1} in {delay}s"
-                )
-                time.sleep(delay)
+        # Retry transient failures (timeouts, 429, 5xx) with exponential backoff
+        # so a single network blip doesn't abort a long pipeline. Permanent
+        # errors (bad request, auth) are raised immediately.
+        response = call_with_retry(
+            self.client.chat.completions.create,
+            max_retries=self.MAX_RETRIES - 1,
+            initial_delay=1.0,
+            retry_if=is_transient_error,
+            description="LLM call",
+            **kwargs,
+        )
 
         content = response.choices[0].message.content
         # Content can be None (content filter, tool-only choice, empty

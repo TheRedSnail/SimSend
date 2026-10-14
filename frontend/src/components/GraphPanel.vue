@@ -246,7 +246,7 @@ const props = defineProps({
   isSimulating: Boolean
 })
 
-const emit = defineEmits(['refresh', 'toggle-maximize'])
+defineEmits(['refresh', 'toggle-maximize'])
 
 const graphContainer = ref(null)
 const graphSvg = ref(null)
@@ -797,8 +797,34 @@ watch(showEdgeLabels, (newVal) => {
   }
 })
 
+// Resize the existing layout instead of rebuilding it (a rebuild wipes the
+// user's zoom/pan/selection), debounced so a drag-resize doesn't thrash.
+const applyResize = () => {
+  if (!currentSimulation || !graphSvg.value || !graphContainer.value) {
+    renderGraph()
+    return
+  }
+  const width = graphContainer.value.clientWidth
+  const height = graphContainer.value.clientHeight
+  d3.select(graphSvg.value)
+    .attr('width', width)
+    .attr('height', height)
+    .attr('viewBox', `0 0 ${width} ${height}`)
+  currentSimulation
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('x', d3.forceX(width / 2).strength(0.04))
+    .force('y', d3.forceY(height / 2).strength(0.04))
+    .alpha(0.1)
+    .restart()
+}
+
+let resizeTimer = null
 const handleResize = () => {
-  nextTick(renderGraph)
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null
+    nextTick(applyResize)
+  }, 200)
 }
 
 onMounted(() => {
@@ -807,8 +833,18 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  if (resizeTimer) {
+    clearTimeout(resizeTimer)
+    resizeTimer = null
+  }
   if (currentSimulation) {
+    currentSimulation.on('tick', null)
     currentSimulation.stop()
+    currentSimulation = null
+  }
+  if (graphSvg.value) {
+    // Drop zoom/drag listeners and nodes that hold closures over the layout
+    d3.select(graphSvg.value).on('.zoom', null).selectAll('*').remove()
   }
 })
 </script>

@@ -74,7 +74,7 @@ const route = useRoute()
 const router = useRouter()
 
 // Props
-const props = defineProps({
+defineProps({
   reportId: String
 })
 

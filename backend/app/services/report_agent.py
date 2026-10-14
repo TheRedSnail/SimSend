@@ -1109,9 +1109,11 @@ class ReportAgent:
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
                 call_data = json.loads(match.group(1))
-                tool_calls.append(call_data)
             except json.JSONDecodeError:
-                pass
+                continue
+            normalized = self._normalize_tool_call(call_data)
+            if normalized:
+                tool_calls.append(normalized)
 
         if tool_calls:
             return tool_calls
@@ -1121,9 +1123,9 @@ class ReportAgent:
         stripped = response.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
             try:
-                call_data = json.loads(stripped)
-                if self._is_valid_tool_call(call_data):
-                    tool_calls.append(call_data)
+                normalized = self._normalize_tool_call(json.loads(stripped))
+                if normalized:
+                    tool_calls.append(normalized)
                     return tool_calls
             except json.JSONDecodeError:
                 pass
@@ -1133,26 +1135,68 @@ class ReportAgent:
         match = re.search(json_pattern, stripped, re.DOTALL)
         if match:
             try:
-                call_data = json.loads(match.group(1))
-                if self._is_valid_tool_call(call_data):
-                    tool_calls.append(call_data)
+                normalized = self._normalize_tool_call(json.loads(match.group(1)))
+                if normalized:
+                    tool_calls.append(normalized)
             except json.JSONDecodeError:
                 pass
 
         return tool_calls
 
+    _TOOL_NAME_KEYS = ("name", "tool", "tool_name", "function")
+    _TOOL_PARAM_KEYS = ("parameters", "params", "arguments", "args", "input")
+
+    def _normalize_tool_call(self, data: Any) -> Optional[Dict[str, Any]]:
+        """Normalize an LLM tool call to {"name": str, "parameters": dict}.
+
+        Accepts the key variants models actually emit ("tool"/"tool_name",
+        "args"/"arguments"/"params", OpenAI-style {"function": {...}}, and
+        arguments given as a JSON string). Returns None for anything that is
+        not a call to a known tool.
+        """
+        if not isinstance(data, dict):
+            return None
+        if isinstance(data.get("function"), dict):  # {"function": {"name":..., "arguments":...}}
+            data = data["function"]
+
+        name = next((data[k] for k in self._TOOL_NAME_KEYS
+                     if isinstance(data.get(k), str) and data.get(k)), None)
+        if not name or name not in self.VALID_TOOL_NAMES:
+            return None
+
+        params: Any = {}
+        for key in self._TOOL_PARAM_KEYS:
+            if key in data and data[key] is not None:
+                params = data[key]
+                break
+        if isinstance(params, str):
+            try:
+                params = json.loads(params) if params.strip() else {}
+            except json.JSONDecodeError:
+                params = {"query": params}
+        if not isinstance(params, dict):
+            params = {}
+        return {"name": name, "parameters": params}
+
     def _is_valid_tool_call(self, data: dict) -> bool:
-        """Validate whether parsed JSON is a valid tool call"""
-        # Support both {"name": ..., "parameters": ...} and {"tool": ..., "params": ...} key formats
-        tool_name = data.get("name") or data.get("tool")
-        if tool_name and tool_name in self.VALID_TOOL_NAMES:
-            # Normalize key names to name / parameters
-            if "tool" in data:
-                data["name"] = data.pop("tool")
-            if "params" in data and "parameters" not in data:
-                data["parameters"] = data.pop("params")
-            return True
-        return False
+        """Backwards-compatible check; prefer _normalize_tool_call."""
+        return self._normalize_tool_call(data) is not None
+
+    # Tool output fed back into the ReACT conversation is capped so a large
+    # graph can't blow the model's context window. Override with
+    # SIMSEND_REPORT_TOOL_RESULT_MAX_CHARS.
+    MAX_TOOL_RESULT_CHARS = int(os.environ.get("SIMSEND_REPORT_TOOL_RESULT_MAX_CHARS", "12000"))
+
+    @classmethod
+    def _truncate_tool_result(cls, result: str, limit: Optional[int] = None) -> str:
+        limit = limit or cls.MAX_TOOL_RESULT_CHARS
+        if result is None:
+            return ""
+        result = str(result)
+        if len(result) <= limit:
+            return result
+        omitted = len(result) - limit
+        return result[:limit] + f" ... [tool output truncated: {omitted} more characters omitted]"
     
     def _get_tools_description(self) -> str:
         """Generate tools description text"""
@@ -1337,15 +1381,14 @@ class ReportAgent:
                 max_tokens=4096
             )
 
-            # Check if LLM returned None (API error or empty content)
-            if response is None:
-                logger.warning(f"Section {section.title} iteration {iteration + 1}: LLM returned None")
-                # If iterations remain, add message and retry
+            # LLMClient.chat returns '' (never None) for an empty completion
+            # (content filter, provider hiccup). Retry instead of treating
+            # nothing as section content.
+            if not response or not response.strip():
+                logger.warning(f"Section {section.title} iteration {iteration + 1}: LLM returned an empty response")
                 if iteration < max_iterations - 1:
-                    messages.append({"role": "assistant", "content": "(empty response)"})
-                    messages.append({"role": "user", "content": "Please continue generating content."})
+                    messages.append({"role": "user", "content": "Your previous reply was empty. Please continue."})
                     continue
-                # Last iteration also returned None, break loop for forced conclusion
                 break
 
             logger.debug(f"LLM response: {response[:200]}...")
@@ -1489,7 +1532,7 @@ class ReportAgent:
                     "role": "user",
                     "content": REACT_OBSERVATION_TEMPLATE.format(
                         tool_name=call["name"],
-                        result=result,
+                        result=self._truncate_tool_result(result),
                         tool_calls_count=tool_calls_count,
                         max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
                         used_tools_str=", ".join(used_tools),
@@ -1534,20 +1577,25 @@ class ReportAgent:
         logger.warning(f"Section {section.title} reached max iterations, forcing generation")
         messages.append({"role": "user", "content": REACT_FORCE_FINAL_MSG})
         
-        response = self.llm.chat(
-            messages=messages,
-            temperature=0.5,
-            max_tokens=4096
-        )
+        response = ""
+        for _ in range(2):
+            response = self.llm.chat(
+                messages=messages,
+                temperature=0.5,
+                max_tokens=4096
+            )
+            if response and response.strip():
+                break
+            logger.warning(f"Section {section.title}: empty response during forced conclusion, retrying")
 
-        # Check if LLM returned None during forced conclusion
-        if response is None:
-            logger.error(f"Section {section.title} LLM returned None during forced conclusion, using default error message")
-            final_answer = "(This section failed to generate: LLM returned empty response, please retry later)"
-        elif "Final Answer:" in response:
+        if not response or not response.strip():
+            # Let generate_report record this section as failed (and keep the
+            # others) rather than saving an empty section as if it succeeded.
+            raise RuntimeError("LLM returned an empty response")
+        if "Final Answer:" in response:
             final_answer = response.split("Final Answer:")[-1].strip()
         else:
-            final_answer = response
+            final_answer = response.strip()
         
         # Log section content generation complete
         if self.report_logger:
@@ -1663,6 +1711,7 @@ class ReportAgent:
             
             total_sections = len(outline.sections)
             generated_sections = []  # Save content for context
+            failed_sections: List[str] = []
             
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
@@ -1683,19 +1732,30 @@ class ReportAgent:
                         f"Generating section: {section.title} ({section_num}/{total_sections})"
                     )
                 
-                # Generate main section content
-                section_content = self._generate_section_react(
-                    section=section,
-                    outline=outline,
-                    previous_sections=generated_sections,
-                    progress_callback=lambda stage, prog, msg:
-                        progress_callback(
-                            stage, 
-                            base_progress + int(prog * 0.7 / total_sections),
-                            msg
-                        ) if progress_callback else None,
-                    section_index=section_num
-                )
+                # Generate main section content. One failing section (LLM/Zep
+                # outage, context overflow) must not throw away the others.
+                try:
+                    section_content = self._generate_section_react(
+                        section=section,
+                        outline=outline,
+                        previous_sections=generated_sections,
+                        progress_callback=lambda stage, prog, msg:
+                            progress_callback(
+                                stage,
+                                base_progress + int(prog * 0.7 / total_sections),
+                                msg
+                            ) if progress_callback else None,
+                        section_index=section_num
+                    )
+                except Exception as section_err:
+                    logger.error(f"Section {section.title} failed: {section_err}")
+                    if self.report_logger:
+                        self.report_logger.log_error(str(section_err), "section_failed", section.title)
+                    failed_sections.append(f"{section.title}: {section_err}")
+                    section_content = (
+                        f"*(This section could not be generated: {section_err}. "
+                        "Regenerate the report to retry.)*"
+                    )
                 
                 section.content = section_content
                 generated_sections.append(f"## {section.title}\n\n{section_content}")
@@ -1734,10 +1794,19 @@ class ReportAgent:
                 completed_sections=completed_section_titles
             )
             
+            if total_sections and len(failed_sections) == total_sections:
+                raise RuntimeError("All sections failed: " + "; ".join(failed_sections))
+
             # Use ReportManager to assemble the complete report
             report.markdown_content = ReportManager.assemble_full_report(report_id, outline)
             report.status = ReportStatus.COMPLETED
             report.completed_at = datetime.now().isoformat()
+            if failed_sections:
+                # Completed, but say plainly which parts are missing
+                report.error = (
+                    f"{len(failed_sections)} of {total_sections} sections failed: "
+                    + "; ".join(failed_sections)
+                )
             
             # Calculate total duration
             total_time_seconds = (datetime.now() - start_time).total_seconds()
@@ -1864,6 +1933,8 @@ class ReportAgent:
                 messages=messages,
                 temperature=0.5
             )
+            if not response or not response.strip():
+                raise RuntimeError("The model returned an empty response; please try again.")
             
             # Parse tool calls
             tool_calls = self._parse_tool_calls(response)
@@ -1887,7 +1958,7 @@ class ReportAgent:
                 result = self._execute_tool(call["name"], call.get("parameters", {}))
                 tool_results.append({
                     "tool": call["name"],
-                    "result": result[:1500]  # Limit result length
+                    "result": self._truncate_tool_result(result, 1500)
                 })
                 tool_calls_made.append(call)
             
@@ -1904,6 +1975,8 @@ class ReportAgent:
             messages=messages,
             temperature=0.5
         )
+        if not final_response or not final_response.strip():
+            raise RuntimeError("The model returned an empty response; please try again.")
         
         # Clean response
         clean_response = re.sub(r'<tool_call>.*?</tool_call>', '', final_response, flags=re.DOTALL)
@@ -1964,7 +2037,7 @@ class ReportManager:
         return os.path.join(cls._get_report_folder(report_id), "meta.json")
     
     @classmethod
-    def _get_report_markdown_path(cls, report_id: str) -> str:
+    def get_report_markdown_path(cls, report_id: str) -> str:
         """Get full report Markdown file path"""
         return os.path.join(cls._get_report_folder(report_id), "full_report.md")
     
@@ -1979,7 +2052,7 @@ class ReportManager:
         return os.path.join(cls._get_report_folder(report_id), "progress.json")
     
     @classmethod
-    def _get_section_path(cls, report_id: str, section_index: int) -> str:
+    def get_section_path(cls, report_id: str, section_index: int) -> str:
         """Get section Markdown file path"""
         return os.path.join(cls._get_report_folder(report_id), f"section_{section_index:02d}.md")
     
@@ -2329,7 +2402,7 @@ class ReportManager:
         md_content = cls._post_process_report(md_content, outline)
         
         # Save complete report
-        full_path = cls._get_report_markdown_path(report_id)
+        full_path = cls.get_report_markdown_path(report_id)
         with open(full_path, 'w', encoding='utf-8') as f:
             f.write(md_content)
         
@@ -2477,7 +2550,7 @@ class ReportManager:
         
         # Save complete Markdown report
         if report.markdown_content:
-            with open(cls._get_report_markdown_path(report.report_id), 'w', encoding='utf-8') as f:
+            with open(cls.get_report_markdown_path(report.report_id), 'w', encoding='utf-8') as f:
                 f.write(report.markdown_content)
         
         logger.info(f"Report saved: {report.report_id}")
@@ -2517,7 +2590,7 @@ class ReportManager:
         # If markdown_content is empty, try reading from full_report.md
         markdown_content = data.get('markdown_content', '')
         if not markdown_content:
-            full_report_path = cls._get_report_markdown_path(report_id)
+            full_report_path = cls.get_report_markdown_path(report_id)
             if os.path.exists(full_report_path):
                 with open(full_report_path, 'r', encoding='utf-8') as f:
                     markdown_content = f.read()

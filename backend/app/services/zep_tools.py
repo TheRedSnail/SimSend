@@ -8,6 +8,7 @@ Core retrieval tools (optimized):
 3. QuickSearch (Simple Search) - Quick retrieval
 """
 
+import threading
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,7 @@ from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.retry import call_with_retry, is_transient_error
 from ..utils.llm_client import LLMClient
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 
@@ -247,8 +249,21 @@ class PanoramaResult:
             "historical_count": self.historical_count
         }
     
+    # Caps for the text handed to the report LLM. A graph can hold thousands of
+    # nodes/facts; listing them all overflows the context window.
+    MAX_TEXT_FACTS = 150
+    MAX_TEXT_HISTORICAL_FACTS = 75
+    MAX_TEXT_NODES = 100
+
+    @staticmethod
+    def _numbered(items: List[str], cap: int) -> List[str]:
+        lines = [f"{i}. \"{item}\"" for i, item in enumerate(items[:cap], 1)]
+        if len(items) > cap:
+            lines.append(f"... and {len(items) - cap} more (omitted)")
+        return lines
+
     def to_text(self) -> str:
-        """Convert to text format (full version, no truncation)"""
+        """Convert to text format (capped so it fits an LLM context)"""
         text_parts = [
             f"## Broad Search Results (Panorama View)",
             f"Query: {self.query}",
@@ -259,24 +274,21 @@ class PanoramaResult:
             f"- Historical/expired facts: {self.historical_count}"
         ]
 
-        # Currently active facts (full output, no truncation)
         if self.active_facts:
             text_parts.append(f"\n### [Currently Active Facts] (simulation results)")
-            for i, fact in enumerate(self.active_facts, 1):
-                text_parts.append(f"{i}. \"{fact}\"")
+            text_parts.extend(self._numbered(self.active_facts, self.MAX_TEXT_FACTS))
 
-        # Historical/expired facts (full output, no truncation)
         if self.historical_facts:
             text_parts.append(f"\n### [Historical/Expired Facts] (evolution records)")
-            for i, fact in enumerate(self.historical_facts, 1):
-                text_parts.append(f"{i}. \"{fact}\"")
+            text_parts.extend(self._numbered(self.historical_facts, self.MAX_TEXT_HISTORICAL_FACTS))
 
-        # Key entities (full output, no truncation)
         if self.all_nodes:
             text_parts.append(f"\n### [Entities Involved]")
-            for node in self.all_nodes:
+            for node in self.all_nodes[:self.MAX_TEXT_NODES]:
                 entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "Entity")
                 text_parts.append(f"- **{node.name}** ({entity_type})")
+            if len(self.all_nodes) > self.MAX_TEXT_NODES:
+                text_parts.append(f"... and {len(self.all_nodes) - self.MAX_TEXT_NODES} more entities (omitted)")
         
         return "\n".join(text_parts)
 
@@ -430,6 +442,12 @@ class ZepToolsService:
         self.client = Zep(api_key=self.api_key)
         # LLM client for InsightForge sub-query generation
         self._llm_client = llm_client
+        # Full-graph snapshots for the local-search fallback, shared by the
+        # parallel InsightForge sub-queries so a Zep search outage costs one
+        # full-graph fetch instead of one per sub-query.
+        self._snapshots: Dict[Any, Any] = {}
+        self._snapshot_locks: Dict[Any, threading.Lock] = {}
+        self._snapshot_guard = threading.Lock()
         logger.info("ZepToolsService initialized")
     
     @property
@@ -440,27 +458,14 @@ class ZepToolsService:
         return self._llm_client
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
-        """API call with retry mechanism"""
-        max_retries = max_retries or self.MAX_RETRIES
-        last_exception = None
-        delay = self.RETRY_DELAY
-        
-        for attempt in range(max_retries):
-            try:
-                return func()
-            except Exception as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Zep {operation_name} attempt {attempt + 1} failed: {str(e)[:100]}, "
-                        f"retrying in {delay:.1f}s..."
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error(f"Zep {operation_name} still failing after {max_retries} attempts: {str(e)}")
-        
-        raise last_exception
+        """API call with retry on transient failures (network, 429, 5xx)"""
+        return call_with_retry(
+            func,
+            max_retries=(max_retries or self.MAX_RETRIES) - 1,
+            initial_delay=self.RETRY_DELAY,
+            retry_if=is_transient_error,
+            description=f"Zep {operation_name}",
+        )
     
     def search_graph(
         self, 
@@ -544,6 +549,21 @@ class ZepToolsService:
             # Fallback: use local keyword matching search
             return self._local_search(graph_id, query, limit, scope)
     
+    LOCAL_SEARCH_SNAPSHOT_TTL = 120.0  # seconds
+
+    def _graph_snapshot(self, graph_id: str, kind: str) -> list:
+        """All edges or nodes of a graph, cached briefly and fetched once under concurrency."""
+        key = (graph_id, kind)
+        with self._snapshot_guard:
+            lock = self._snapshot_locks.setdefault(key, threading.Lock())
+        with lock:
+            cached = self._snapshots.get(key)
+            if cached and time.monotonic() - cached[0] < self.LOCAL_SEARCH_SNAPSHOT_TTL:
+                return cached[1]
+            data = self.get_all_edges(graph_id) if kind == "edges" else self.get_all_nodes(graph_id)
+            self._snapshots[key] = (time.monotonic(), data)
+            return data
+
     def _local_search(
         self, 
         graph_id: str, 
@@ -593,7 +613,7 @@ class ZepToolsService:
         try:
             if scope in ["edges", "both"]:
                 # Get all edges and match
-                all_edges = self.get_all_edges(graph_id)
+                all_edges = self._graph_snapshot(graph_id, "edges")
                 scored_edges = []
                 for edge in all_edges:
                     score = match_score(edge.fact) + match_score(edge.name)
@@ -616,7 +636,7 @@ class ZepToolsService:
             
             if scope in ["nodes", "both"]:
                 # Get all nodes and match
-                all_nodes = self.get_all_nodes(graph_id)
+                all_nodes = self._graph_snapshot(graph_id, "nodes")
                 scored_nodes = []
                 for node in all_nodes:
                     score = match_score(node.name) + match_score(node.summary)

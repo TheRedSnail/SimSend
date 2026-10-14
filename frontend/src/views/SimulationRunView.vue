@@ -67,18 +67,21 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import { usePolling, useDisposed } from '../composables/usePolling'
+import { graphChanged } from '../utils/graph'
 
 const route = useRoute()
 const router = useRouter()
+const isDisposed = useDisposed()
 
 // Props
-const props = defineProps({
+defineProps({
   simulationId: String
 })
 
@@ -188,7 +191,8 @@ const handleGoBack = async () => {
     addLog(`Failed to check simulation status: ${err.message}`)
   }
 
-  // Return to Step 2 (Environment Setup)
+  // Return to Step 2 (Environment Setup), unless the user already went elsewhere
+  if (isDisposed()) return
   router.push({ name: 'Simulation', params: { simulationId: currentSimulationId.value } })
 }
 
@@ -205,6 +209,7 @@ const loadSimulationData = async () => {
 
     // Get simulation info
     const simRes = await getSimulation(currentSimulationId.value)
+    if (isDisposed()) return
     if (simRes.success && simRes.data) {
       const simData = simRes.data
 
@@ -222,6 +227,7 @@ const loadSimulationData = async () => {
       // Get project info
       if (simData.project_id) {
         const projRes = await getProject(simData.project_id)
+        if (isDisposed()) return
         if (projRes.success && projRes.data) {
           projectData.value = projRes.data
           addLog(`Project loaded: ${projRes.data.project_id}`)
@@ -240,18 +246,20 @@ const loadSimulationData = async () => {
   }
 }
 
-const loadGraph = async (graphId) => {
-  // During simulation, auto-refresh does not show full-screen loading to avoid flickering
-  // Manual refresh or initial load shows loading
-  if (!isSimulating.value) {
+const loadGraph = async (graphId, { background = false } = {}) => {
+  // Background auto-refresh does not show full-screen loading to avoid flickering
+  if (!background) {
     graphLoading.value = true
   }
-  
+
   try {
     const res = await getGraphData(graphId)
-    if (res.success) {
+    if (isDisposed()) return
+    // Background refreshes only reassign when the graph changed, otherwise
+    // GraphPanel rebuilds the layout and wipes the user's zoom/pan/selection.
+    if (!background || graphChanged(graphData.value, res.data)) {
       graphData.value = res.data
-      if (!isSimulating.value) {
+      if (!background) {
         addLog('Graph data loaded successfully')
       }
     }
@@ -269,21 +277,22 @@ const refreshGraph = () => {
 }
 
 // --- Auto Refresh Logic ---
-let graphRefreshTimer = null
+const graphRefresher = usePolling(async () => {
+  if (projectData.value?.graph_id) {
+    await loadGraph(projectData.value.graph_id, { background: true })
+  }
+}, { interval: 30000, immediate: false })
 
 const startGraphRefresh = () => {
-  if (graphRefreshTimer) return
+  if (graphRefresher.isActive.value) return
   addLog('Starting graph auto-refresh (30s)')
-  // Refresh immediately, then every 30 seconds
-  graphRefreshTimer = setInterval(refreshGraph, 30000)
+  graphRefresher.start()
 }
 
 const stopGraphRefresh = () => {
-  if (graphRefreshTimer) {
-    clearInterval(graphRefreshTimer)
-    graphRefreshTimer = null
-    addLog('Stopped graph auto-refresh')
-  }
+  if (!graphRefresher.isActive.value) return
+  graphRefresher.stop()
+  addLog('Stopped graph auto-refresh')
 }
 
 watch(isSimulating, (newValue) => {
@@ -303,10 +312,6 @@ onMounted(() => {
   }
   
   loadSimulationData()
-})
-
-onUnmounted(() => {
-  stopGraphRefresh()
 })
 </script>
 

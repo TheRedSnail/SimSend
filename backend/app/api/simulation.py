@@ -4,24 +4,58 @@ Step2: Zep entity reading & filtering, OASIS simulation preparation & execution 
 """
 
 import os
-import traceback
+import json
+import threading
+from datetime import datetime
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
+from .errors import error_response, public_task_error
 from ..config import Config
 from ..services.zep_entity_reader import ZepEntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
-from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.simulation_runner import SimulationRunner
 from ..utils.logger import get_logger
 from ..utils.jobs import submit_job
+from ..utils.atomic_io import atomic_write_json
+from ..utils.validation import (
+    InputError, parse_bool, parse_int, parse_platform, parse_string_list,
+    query_int, require_text, QUERY_PLATFORMS, BODY_PLATFORMS,
+)
 from ..models.project import ProjectManager
+from ..models.task import TaskManager, TaskStatus
 
 logger = get_logger('mirofish.api.simulation')
 
 # Upper bound for client-supplied interview timeouts. Without a cap, a request
 # with timeout=86400 would pin a worker thread for a day.
 MAX_INTERVIEW_TIMEOUT = 600  # 10 minutes
+
+# Size caps for interview requests.
+MAX_PROMPT_CHARS = 5000
+MAX_BATCH_INTERVIEWS = 200
+
+# Serializes "is a job already running for this simulation?" checks with the
+# creation of the job, so double-clicks can't start duplicate work.
+_job_start_lock = threading.Lock()
+
+
+def _simulation_dir(simulation_id: str) -> str:
+    """Path of a simulation's data directory (never creates it)."""
+    return os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+
+
+def _connect_readonly(db_path: str):
+    """Open a simulation SQLite DB read-only (a read endpoint must never
+    create or modify a database file)."""
+    import sqlite3
+    from pathlib import Path
+    return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def _parse_agent_id(value, name: str = "agent_id") -> int:
+    return parse_int(value, name, minimum=0, maximum=10_000_000)
 
 
 def _clamp_timeout(value, default):
@@ -95,12 +129,7 @@ def get_graph_entities(graph_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get graph entities: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get graph entities")
 
 
 @simulation_bp.route('/entities/<graph_id>/<entity_uuid>', methods=['GET'])
@@ -128,12 +157,7 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get entity details: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get entity details")
 
 
 @simulation_bp.route('/entities/<graph_id>/by-type/<entity_type>', methods=['GET'])
@@ -165,12 +189,7 @@ def get_entities_by_type(graph_id: str, entity_type: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get entities: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get entities")
 
 
 # ============== Simulation Management Endpoints ==============
@@ -221,19 +240,33 @@ def create_simulation():
                 "error": f"Project does not exist: {project_id}"
             }), 404
         
-        graph_id = data.get('graph_id') or project.graph_id
+        graph_id = project.graph_id
         if not graph_id:
             return jsonify({
                 "success": False,
                 "error": "Project has not built a graph yet, please call /api/graph/build first"
             }), 400
         
+        # A client-supplied graph_id is only accepted if it is this project's
+        # graph; otherwise a simulation could be pointed at any other graph.
+        requested_graph_id = data.get('graph_id')
+        if requested_graph_id and requested_graph_id != graph_id:
+            return jsonify({
+                "success": False,
+                "error": "graph_id does not belong to this project"
+            }), 400
+
+        enable_twitter = parse_bool(data.get('enable_twitter'), 'enable_twitter', default=True)
+        enable_reddit = parse_bool(data.get('enable_reddit'), 'enable_reddit', default=True)
+        if not (enable_twitter or enable_reddit):
+            raise InputError("At least one of enable_twitter / enable_reddit must be true")
+
         manager = SimulationManager()
         state = manager.create_simulation(
             project_id=project_id,
             graph_id=graph_id,
-            enable_twitter=data.get('enable_twitter', True),
-            enable_reddit=data.get('enable_reddit', True),
+            enable_twitter=enable_twitter,
+            enable_reddit=enable_reddit,
         )
         
         return jsonify({
@@ -242,12 +275,7 @@ def create_simulation():
         })
         
     except Exception as e:
-        logger.error(f"Failed to create simulation: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to create simulation")
 
 
 def _check_simulation_prepared(simulation_id: str) -> tuple:
@@ -266,10 +294,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
     Returns:
         (is_prepared: bool, info: dict)
     """
-    import os
-    from ..config import Config
-    
-    simulation_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+    simulation_dir = _simulation_dir(simulation_id)
     
     # Check if directory exists
     if not os.path.exists(simulation_dir):
@@ -303,7 +328,6 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
     # Check status in state.json
     state_file = os.path.join(simulation_dir, "state.json")
     try:
-        import json
         with open(state_file, 'r', encoding='utf-8') as f:
             state_data = json.load(f)
         
@@ -325,7 +349,6 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         if status in prepared_statuses and config_generated:
             # Get file statistics
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
-            config_file = os.path.join(simulation_dir, "simulation_config.json")
             
             profiles_count = 0
             if os.path.exists(profiles_file):
@@ -337,10 +360,9 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             if status == "preparing":
                 try:
                     state_data["status"] = "ready"
-                    from datetime import datetime
                     state_data["updated_at"] = datetime.now().isoformat()
-                    with open(state_file, 'w', encoding='utf-8') as f:
-                        json.dump(state_data, f, ensure_ascii=False, indent=2)
+                    # Atomic: pollers read state.json concurrently.
+                    atomic_write_json(state_file, state_data, create_dirs=False)
                     logger.info(f"Auto-updated simulation status: {simulation_id} preparing -> ready")
                     status = "ready"
                 except Exception as e:
@@ -366,7 +388,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
             }
             
     except Exception as e:
-        return False, {"reason": f"Failed to read state file: {str(e)}"}
+        logger.warning(f"Failed to read state file for {simulation_id}: {e}")
+        return False, {"reason": "Failed to read state file"}
 
 
 @simulation_bp.route('/prepare', methods=['POST'])
@@ -410,11 +433,6 @@ def prepare_simulation():
             }
         }
     """
-    import threading
-    import os
-    from ..models.task import TaskManager, TaskStatus
-    from ..config import Config
-    
     try:
         data = request.get_json() or {}
         
@@ -425,6 +443,16 @@ def prepare_simulation():
                 "error": "Please provide simulation_id"
             }), 400
         
+        # Validate client parameters up front
+        force_regenerate = parse_bool(data.get('force_regenerate'), 'force_regenerate')
+        entity_types_list = parse_string_list(data.get('entity_types'), 'entity_types')
+        use_llm_for_profiles = parse_bool(data.get('use_llm_for_profiles'), 'use_llm_for_profiles', default=True)
+        # Each unit is one concurrent LLM call, so this is capped server-side.
+        parallel_profile_count = parse_int(
+            data.get('parallel_profile_count'), 'parallel_profile_count',
+            default=5, minimum=1, maximum=Config.MAX_PARALLEL_PROFILE_COUNT
+        )
+
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
         
@@ -434,8 +462,6 @@ def prepare_simulation():
                 "error": f"Simulation does not exist: {simulation_id}"
             }), 404
         
-        # Check if force regeneration is requested
-        force_regenerate = data.get('force_regenerate', False)
         logger.info(f"Processing /prepare request: simulation_id={simulation_id}, force_regenerate={force_regenerate}")
 
         # Check if preparation is already complete (avoid redundant generation)
@@ -477,9 +503,33 @@ def prepare_simulation():
         # Get document text
         document_text = ProjectManager.get_extracted_text(state.project_id) or ""
         
-        entity_types_list = data.get('entity_types')
-        use_llm_for_profiles = data.get('use_llm_for_profiles', True)
-        parallel_profile_count = data.get('parallel_profile_count', 5)
+        # Don't start a second preparation while one is still running (e.g. a
+        # double-click or a client retry): hand back the running task instead.
+        task_manager = TaskManager()
+        with _job_start_lock:
+            active = task_manager.find_active_task("simulation_prepare", simulation_id=simulation_id)
+            if active is None:
+                task_id = task_manager.create_task(
+                    task_type="simulation_prepare",
+                    metadata={
+                        "simulation_id": simulation_id,
+                        "project_id": state.project_id
+                    }
+                )
+        if active is not None:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "simulation_id": simulation_id,
+                    "task_id": active.task_id,
+                    "status": "preparing",
+                    "message": "Preparation is already in progress",
+                    "already_prepared": False,
+                    "already_running": True,
+                    "expected_entities_count": state.entities_count,
+                    "entity_types": state.entity_types
+                }
+            })
         
         # ========== Synchronously get entity count (before starting background task) ==========
         # This allows frontend to get the expected total Agent count immediately after calling prepare
@@ -500,19 +550,14 @@ def prepare_simulation():
             logger.warning(f"Failed to synchronously get entity count (will retry in background task): {e}")
             # Failure doesn't affect subsequent flow, background task will retry
 
-        # Create async task
-        task_manager = TaskManager()
-        task_id = task_manager.create_task(
-            task_type="simulation_prepare",
-            metadata={
-                "simulation_id": simulation_id,
-                "project_id": state.project_id
-            }
-        )
-        
         # Update simulation state (includes pre-fetched entity count)
         state.status = SimulationStatus.PREPARING
-        manager._save_simulation_state(state)
+        try:
+            manager.save_simulation_state(state)
+        except Exception:
+            # Don't leave a pending task that would block every later /prepare.
+            task_manager.fail_task(task_id, "Failed to start preparation")
+            raise
         
         # Define background task
         def run_prepare():
@@ -606,15 +651,15 @@ def prepare_simulation():
                 )
                 
             except Exception as e:
-                logger.error(f"Failed to prepare simulation: {str(e)}")
-                task_manager.fail_task(task_id, str(e))
+                error = public_task_error(e, "Failed to prepare simulation")
+                task_manager.fail_task(task_id, error)
 
                 # Update simulation status to failed
                 state = manager.get_simulation(simulation_id)
                 if state:
                     state.status = SimulationStatus.FAILED
-                    state.error = str(e)
-                    manager._save_simulation_state(state)
+                    state.error = error
+                    manager.save_simulation_state(state)
         
         # Submit to the shared bounded job pool
         submit_job(run_prepare)
@@ -639,12 +684,7 @@ def prepare_simulation():
         }), 404
         
     except Exception as e:
-        logger.error(f"Failed to start preparation task: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to start preparation task")
 
 
 @simulation_bp.route('/prepare/status', methods=['POST'])
@@ -675,8 +715,6 @@ def get_prepare_status():
             }
         }
     """
-    from ..models.task import TaskManager
-    
     try:
         data = request.get_json() or {}
         
@@ -753,11 +791,7 @@ def get_prepare_status():
         })
         
     except Exception as e:
-        logger.error(f"Failed to query task status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return error_response(e, "Failed to query task status")
 
 
 @simulation_bp.route('/<simulation_id>', methods=['GET'])
@@ -785,12 +819,7 @@ def get_simulation(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get simulation status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get simulation status")
 
 
 @simulation_bp.route('/list', methods=['GET'])
@@ -814,71 +843,39 @@ def list_simulations():
         })
         
     except Exception as e:
-        logger.error(f"Failed to list simulations: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to list simulations")
 
 
-def _get_report_id_for_simulation(simulation_id: str) -> str:
+def _latest_report_ids_by_simulation() -> dict:
     """
-    Get the latest report_id corresponding to a simulation
-
-    Traverses the reports directory to find reports matching simulation_id.
-    If there are multiple, returns the most recent one (sorted by created_at).
-
-    Args:
-        simulation_id: Simulation ID
-
-    Returns:
-        report_id or None
+    Map simulation_id -> most recent report_id, scanning the reports directory
+    once (each report's meta.json is read a single time).
     """
-    import json
-    from datetime import datetime
-    
-    # reports directory path: backend/uploads/reports
-    # __file__ is app/api/simulation.py, need to go up two levels to backend/
-    reports_dir = os.path.join(os.path.dirname(__file__), '../../uploads/reports')
-    if not os.path.exists(reports_dir):
-        return None
-    
-    matching_reports = []
-    
-    try:
-        for report_folder in os.listdir(reports_dir):
-            report_path = os.path.join(reports_dir, report_folder)
-            if not os.path.isdir(report_path):
-                continue
-            
-            meta_file = os.path.join(report_path, "meta.json")
-            if not os.path.exists(meta_file):
-                continue
-            
-            try:
-                with open(meta_file, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-                
-                if meta.get("simulation_id") == simulation_id:
-                    matching_reports.append({
-                        "report_id": meta.get("report_id"),
-                        "created_at": meta.get("created_at", ""),
-                        "status": meta.get("status", "")
-                    })
-            except Exception:
-                continue
-        
-        if not matching_reports:
-            return None
-        
-        # Sort by creation time descending, return the most recent
-        matching_reports.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        return matching_reports[0].get("report_id")
-        
-    except Exception as e:
-        logger.warning(f"Failed to find report for simulation {simulation_id}: {e}")
-        return None
+    reports_dir = Config.REPORTS_DIR
+    latest = {}
+    if not os.path.isdir(reports_dir):
+        return {}
+
+    for report_folder in os.listdir(reports_dir):
+        meta_file = os.path.join(reports_dir, report_folder, "meta.json")
+        if not os.path.isfile(meta_file):
+            continue
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+
+        simulation_id = meta.get("simulation_id")
+        report_id = meta.get("report_id")
+        if not simulation_id or not report_id:
+            continue
+        created_at = meta.get("created_at", "")
+        current = latest.get(simulation_id)
+        if current is None or created_at > current[0]:
+            latest[simulation_id] = (created_at, report_id)
+
+    return {sim_id: report_id for sim_id, (_, report_id) in latest.items()}
 
 
 @simulation_bp.route('/history', methods=['GET'])
@@ -908,8 +905,7 @@ def get_simulation_history():
                     "updated_at": "2024-12-10",
                     "total_rounds": 120,
                     "current_round": 120,
-                    "report_id": "report_xxxx",
-                    "version": "v1.0.2"
+                    "report_id": "report_xxxx"
                 },
                 ...
             ],
@@ -917,10 +913,14 @@ def get_simulation_history():
         }
     """
     try:
-        limit = request.args.get('limit', 20, type=int)
+        limit = query_int('limit', default=20, minimum=1, maximum=200)
         
         manager = SimulationManager()
-        simulations = manager.list_simulations()[:limit]
+        simulations = manager.list_simulations()
+        # Newest first, so the limit keeps the most recent simulations
+        simulations.sort(key=lambda s: s.created_at or "", reverse=True)
+        simulations = simulations[:limit]
+        report_ids = _latest_report_ids_by_simulation()
         
         # Enrich simulation data, read only from Simulation files
         enriched_simulations = []
@@ -965,18 +965,11 @@ def get_simulation_history():
             else:
                 sim_dict["files"] = []
             
-            # Get associated report_id (find the most recent report for this simulation)
-            sim_dict["report_id"] = _get_report_id_for_simulation(sim.simulation_id)
-            
-            # Add version number
-            sim_dict["version"] = "v1.0.2"
+            # Associated report_id (the most recent report for this simulation)
+            sim_dict["report_id"] = report_ids.get(sim.simulation_id)
             
             # Format date
-            try:
-                created_date = sim_dict.get("created_at", "")[:10]
-                sim_dict["created_date"] = created_date
-            except:
-                sim_dict["created_date"] = ""
+            sim_dict["created_date"] = (sim_dict.get("created_at") or "")[:10]
             
             enriched_simulations.append(sim_dict)
         
@@ -987,12 +980,7 @@ def get_simulation_history():
         })
         
     except Exception as e:
-        logger.error(f"Failed to get simulation history: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get simulation history")
 
 
 @simulation_bp.route('/<simulation_id>/profiles', methods=['GET'])
@@ -1004,7 +992,7 @@ def get_simulation_profiles(simulation_id: str):
         platform: Platform type (reddit/twitter, default reddit)
     """
     try:
-        platform = request.args.get('platform', 'reddit')
+        platform = parse_platform(request.args.get('platform'), QUERY_PLATFORMS, default='reddit')
         
         manager = SimulationManager()
         profiles = manager.get_profiles(simulation_id, platform=platform)
@@ -1025,12 +1013,7 @@ def get_simulation_profiles(simulation_id: str):
         }), 404
         
     except Exception as e:
-        logger.error(f"Failed to get profiles: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get profiles")
 
 
 @simulation_bp.route('/<simulation_id>/profiles/realtime', methods=['GET'])
@@ -1061,15 +1044,13 @@ def get_simulation_profiles_realtime(simulation_id: str):
             }
         }
     """
-    import json
     import csv
-    from datetime import datetime
     
     try:
-        platform = request.args.get('platform', 'reddit')
+        platform = parse_platform(request.args.get('platform'), QUERY_PLATFORMS, default='reddit')
         
         # Get simulation directory
-        sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+        sim_dir = _simulation_dir(simulation_id)
 
         if not os.path.exists(sim_dir):
             return jsonify({
@@ -1135,12 +1116,7 @@ def get_simulation_profiles_realtime(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get real-time profiles: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get real-time profiles")
 
 
 @simulation_bp.route('/<simulation_id>/config/realtime', methods=['GET'])
@@ -1167,12 +1143,9 @@ def get_simulation_config_realtime(simulation_id: str):
             }
         }
     """
-    import json
-    from datetime import datetime
-    
     try:
         # Get simulation directory
-        sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+        sim_dir = _simulation_dir(simulation_id)
 
         if not os.path.exists(sim_dir):
             return jsonify({
@@ -1255,12 +1228,7 @@ def get_simulation_config_realtime(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get real-time config: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get real-time config")
 
 
 @simulation_bp.route('/<simulation_id>/config', methods=['GET'])
@@ -1291,21 +1259,14 @@ def get_simulation_config(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get config: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get config")
 
 
 @simulation_bp.route('/<simulation_id>/config/download', methods=['GET'])
 def download_simulation_config(simulation_id: str):
     """Download simulation config file"""
     try:
-        manager = SimulationManager()
-        sim_dir = manager._get_simulation_dir(simulation_id)
-        config_path = os.path.join(sim_dir, "simulation_config.json")
+        config_path = os.path.join(_simulation_dir(simulation_id), "simulation_config.json")
         
         if not os.path.exists(config_path):
             return jsonify({
@@ -1320,12 +1281,7 @@ def download_simulation_config(simulation_id: str):
         )
         
     except Exception as e:
-        logger.error(f"Failed to download config: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to download config")
 
 
 @simulation_bp.route('/script/<script_name>/download', methods=['GET'])
@@ -1354,7 +1310,7 @@ def download_simulation_script(script_name: str):
         if script_name not in allowed_scripts:
             return jsonify({
                 "success": False,
-                "error": f"Unknown script: {script_name}, allowed: {allowed_scripts}"
+                "error": f"Unknown script, allowed: {allowed_scripts}"
             }), 400
         
         script_path = os.path.join(scripts_dir, script_name)
@@ -1372,12 +1328,7 @@ def download_simulation_script(script_name: str):
         )
         
     except Exception as e:
-        logger.error(f"Failed to download script: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to download script")
 
 
 # ============== Profile Generation Endpoints (Standalone) ==============
@@ -1387,13 +1338,19 @@ def generate_profiles():
     """
     Generate OASIS Agent Profiles directly from graph (without creating a simulation)
 
+    Runs as a background task (one LLM call per entity can take minutes).
+    Poll GET /api/graph/task/<task_id>; the profiles are in the task result.
+
     Request (JSON):
         {
             "graph_id": "mirofish_xxxx",     // Required
             "entity_types": ["Student"],      // Optional
             "use_llm": true,                  // Optional
-            "platform": "reddit"              // Optional
+            "platform": "reddit"              // Optional: reddit (default) / twitter
         }
+
+    Response (202):
+        {"success": true, "data": {"task_id": "...", "graph_id": "...", "platform": "reddit"}}
     """
     try:
         data = request.get_json() or {}
@@ -1405,53 +1362,70 @@ def generate_profiles():
                 "error": "Please provide graph_id"
             }), 400
         
-        entity_types = data.get('entity_types')
-        use_llm = data.get('use_llm', True)
-        platform = data.get('platform', 'reddit')
+        entity_types = parse_string_list(data.get('entity_types'), 'entity_types')
+        use_llm = parse_bool(data.get('use_llm'), 'use_llm', default=True)
+        platform = parse_platform(data.get('platform'), QUERY_PLATFORMS, default='reddit')
         
-        reader = ZepEntityReader()
-        filtered = reader.filter_defined_entities(
-            graph_id=graph_id,
-            defined_entity_types=entity_types,
-            enrich_with_edges=True
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(
+            task_type="profiles_generate",
+            metadata={"graph_id": graph_id, "platform": platform}
         )
         
-        if filtered.filtered_count == 0:
-            return jsonify({
-                "success": False,
-                "error": "No matching entities found"
-            }), 400
+        def run_generate_profiles():
+            try:
+                task_manager.update_task(
+                    task_id, status=TaskStatus.PROCESSING, progress=5,
+                    message="Reading graph entities..."
+                )
+                reader = ZepEntityReader()
+                filtered = reader.filter_defined_entities(
+                    graph_id=graph_id,
+                    defined_entity_types=entity_types,
+                    enrich_with_edges=True
+                )
+                if filtered.filtered_count == 0:
+                    task_manager.fail_task(task_id, "No matching entities found")
+                    return
         
-        generator = OasisProfileGenerator()
-        profiles = generator.generate_profiles_from_entities(
-            entities=filtered.entities,
-            use_llm=use_llm
-        )
+                task_manager.update_task(
+                    task_id, progress=20,
+                    message=f"Generating {filtered.filtered_count} profiles..."
+                )
+                generator = OasisProfileGenerator()
+                profiles = generator.generate_profiles_from_entities(
+                    entities=filtered.entities,
+                    use_llm=use_llm
+                )
         
-        if platform == "reddit":
-            profiles_data = [p.to_reddit_format() for p in profiles]
-        elif platform == "twitter":
-            profiles_data = [p.to_twitter_format() for p in profiles]
-        else:
-            profiles_data = [p.to_dict() for p in profiles]
+                if platform == "twitter":
+                    profiles_data = [p.to_twitter_format() for p in profiles]
+                else:
+                    profiles_data = [p.to_reddit_format() for p in profiles]
+
+                task_manager.complete_task(task_id, {
+                    "platform": platform,
+                    "entity_types": list(filtered.entity_types),
+                    "count": len(profiles_data),
+                    "profiles": profiles_data
+                })
+            except Exception as e:
+                task_manager.fail_task(task_id, public_task_error(e, "Failed to generate profiles"))
+
+        submit_job(run_generate_profiles)
         
         return jsonify({
             "success": True,
             "data": {
+                "task_id": task_id,
+                "graph_id": graph_id,
                 "platform": platform,
-                "entity_types": list(filtered.entity_types),
-                "count": len(profiles_data),
-                "profiles": profiles_data
+                "message": "Profile generation started, query progress via /api/graph/task/{task_id}"
             }
-        })
+        }), 202
         
     except Exception as e:
-        logger.error(f"Failed to generate profiles: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to generate profiles")
 
 
 # ============== Simulation Run Control Endpoints ==============
@@ -1507,31 +1481,17 @@ def start_simulation():
                 "error": "Please provide simulation_id"
             }), 400
 
-        platform = data.get('platform', 'parallel')
-        max_rounds = data.get('max_rounds')  # Optional: max simulation rounds
-        enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # Optional: enable graph memory update
-        force = data.get('force', False)  # Optional: force restart
-
-        # Validate max_rounds parameter
-        if max_rounds is not None:
-            try:
-                max_rounds = int(max_rounds)
-                if max_rounds <= 0:
-                    return jsonify({
-                        "success": False,
-                        "error": "max_rounds must be a positive integer"
-                    }), 400
-            except (ValueError, TypeError):
-                return jsonify({
-                    "success": False,
-                    "error": "max_rounds must be a valid integer"
-                }), 400
-
-        if platform not in ['twitter', 'reddit', 'parallel']:
-            return jsonify({
-                "success": False,
-                "error": f"Invalid platform type: {platform}, allowed: twitter/reddit/parallel"
-            }), 400
+        platform = parse_platform(data.get('platform'), BODY_PLATFORMS, default='parallel')
+        # Optional: max simulation rounds (capped so one request can't run for days)
+        max_rounds = parse_int(
+            data.get('max_rounds'), 'max_rounds',
+            minimum=1, maximum=Config.MAX_SIMULATION_ROUNDS
+        )
+        # Optional: enable graph memory update
+        enable_graph_memory_update = parse_bool(
+            data.get('enable_graph_memory_update'), 'enable_graph_memory_update'
+        )
+        force = parse_bool(data.get('force'), 'force')  # Optional: force restart
 
         # Check if simulation is ready
         manager = SimulationManager()
@@ -1581,7 +1541,7 @@ def start_simulation():
                 # Process doesn't exist or has ended, reset status to ready
                 logger.info(f"Simulation {simulation_id} preparation complete, resetting status to ready (original status: {state.status.value})")
                 state.status = SimulationStatus.READY
-                manager._save_simulation_state(state)
+                manager.save_simulation_state(state)
             else:
                 # Preparation incomplete
                 return jsonify({
@@ -1619,7 +1579,7 @@ def start_simulation():
         
         # Update simulation status
         state.status = SimulationStatus.RUNNING
-        manager._save_simulation_state(state)
+        manager.save_simulation_state(state)
         
         response_data = run_state.to_dict()
         if max_rounds:
@@ -1635,18 +1595,22 @@ def start_simulation():
         })
         
     except ValueError as e:
+        message = str(e)
+        # Capacity / conflict errors from SimulationRunner get distinct codes so
+        # clients can tell "try later" apart from "bad request".
+        if message.startswith("Too many simulations running"):
+            status = 429
+        elif message.startswith("Simulation already running"):
+            status = 409
+        else:
+            status = 400
         return jsonify({
             "success": False,
-            "error": str(e)
-        }), 400
+            "error": message
+        }), status
         
     except Exception as e:
-        logger.error(f"Failed to start simulation: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to start simulation")
 
 
 @simulation_bp.route('/stop', methods=['POST'])
@@ -1686,7 +1650,7 @@ def stop_simulation():
         state = manager.get_simulation(simulation_id)
         if state:
             state.status = SimulationStatus.PAUSED
-            manager._save_simulation_state(state)
+            manager.save_simulation_state(state)
         
         return jsonify({
             "success": True,
@@ -1700,12 +1664,7 @@ def stop_simulation():
         }), 400
         
     except Exception as e:
-        logger.error(f"Failed to stop simulation: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to stop simulation")
 
 
 # ============== Real-time Status Monitoring Endpoints ==============
@@ -1760,12 +1719,7 @@ def get_run_status(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get run status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get run status")
 
 
 @simulation_bp.route('/<simulation_id>/run-status/detail', methods=['GET'])
@@ -1807,7 +1761,7 @@ def get_run_status_detail(simulation_id: str):
     """
     try:
         run_state = SimulationRunner.get_run_state(simulation_id)
-        platform_filter = request.args.get('platform')
+        platform_filter = parse_platform(request.args.get('platform'), QUERY_PLATFORMS)
         
         if not run_state:
             return jsonify({
@@ -1861,12 +1815,7 @@ def get_run_status_detail(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get detailed status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get detailed status")
 
 
 @simulation_bp.route('/<simulation_id>/actions', methods=['GET'])
@@ -1891,11 +1840,11 @@ def get_simulation_actions(simulation_id: str):
         }
     """
     try:
-        limit = request.args.get('limit', 100, type=int)
-        offset = request.args.get('offset', 0, type=int)
-        platform = request.args.get('platform')
-        agent_id = request.args.get('agent_id', type=int)
-        round_num = request.args.get('round_num', type=int)
+        limit = query_int('limit', default=100, minimum=1, maximum=1000)
+        offset = query_int('offset', default=0, minimum=0)
+        platform = parse_platform(request.args.get('platform'), QUERY_PLATFORMS)
+        agent_id = query_int('agent_id', default=None, minimum=0)
+        round_num = query_int('round_num', default=None, minimum=0)
         
         actions = SimulationRunner.get_actions(
             simulation_id=simulation_id,
@@ -1915,12 +1864,7 @@ def get_simulation_actions(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get action history: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get action history")
 
 
 @simulation_bp.route('/<simulation_id>/timeline', methods=['GET'])
@@ -1937,8 +1881,8 @@ def get_simulation_timeline(simulation_id: str):
     Returns summary information per round
     """
     try:
-        start_round = request.args.get('start_round', 0, type=int)
-        end_round = request.args.get('end_round', type=int)
+        start_round = query_int('start_round', default=0, minimum=0)
+        end_round = query_int('end_round', default=None, minimum=0)
         
         timeline = SimulationRunner.get_timeline(
             simulation_id=simulation_id,
@@ -1955,12 +1899,7 @@ def get_simulation_timeline(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get timeline: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get timeline")
 
 
 @simulation_bp.route('/<simulation_id>/agent-stats', methods=['GET'])
@@ -1982,12 +1921,7 @@ def get_agent_stats(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get Agent stats: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get Agent stats")
 
 
 # ============== Database Query Endpoints ==============
@@ -2005,14 +1939,13 @@ def get_simulation_posts(simulation_id: str):
     Returns post list (read from SQLite database)
     """
     try:
-        platform = request.args.get('platform', 'reddit')
-        limit = request.args.get('limit', 50, type=int)
-        offset = request.args.get('offset', 0, type=int)
+        # platform is part of the DB file name, so it must be allowlisted;
+        # a negative LIMIT would make SQLite return the whole table.
+        platform = parse_platform(request.args.get('platform'), QUERY_PLATFORMS, default='reddit')
+        limit = query_int('limit', default=50, minimum=1, maximum=500)
+        offset = query_int('offset', default=0, minimum=0)
         
-        sim_dir = os.path.join(
-            os.path.dirname(__file__),
-            f'../../uploads/simulations/{simulation_id}'
-        )
+        sim_dir = _simulation_dir(simulation_id)
         
         db_file = f"{platform}_simulation.db"
         db_path = os.path.join(sim_dir, db_file)
@@ -2029,7 +1962,7 @@ def get_simulation_posts(simulation_id: str):
             })
         
         import sqlite3
-        conn = sqlite3.connect(db_path)
+        conn = _connect_readonly(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -2062,12 +1995,7 @@ def get_simulation_posts(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get posts: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get posts")
 
 
 @simulation_bp.route('/<simulation_id>/comments', methods=['GET'])
@@ -2081,14 +2009,11 @@ def get_simulation_comments(simulation_id: str):
         offset: Offset
     """
     try:
-        post_id = request.args.get('post_id')
-        limit = request.args.get('limit', 50, type=int)
-        offset = request.args.get('offset', 0, type=int)
+        post_id = query_int('post_id', default=None, minimum=0)
+        limit = query_int('limit', default=50, minimum=1, maximum=500)
+        offset = query_int('offset', default=0, minimum=0)
         
-        sim_dir = os.path.join(
-            os.path.dirname(__file__),
-            f'../../uploads/simulations/{simulation_id}'
-        )
+        sim_dir = _simulation_dir(simulation_id)
         
         db_path = os.path.join(sim_dir, "reddit_simulation.db")
         
@@ -2102,12 +2027,12 @@ def get_simulation_comments(simulation_id: str):
             })
         
         import sqlite3
-        conn = sqlite3.connect(db_path)
+        conn = _connect_readonly(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         try:
-            if post_id:
+            if post_id is not None:
                 cursor.execute("""
                     SELECT * FROM comment 
                     WHERE post_id = ?
@@ -2137,12 +2062,7 @@ def get_simulation_comments(simulation_id: str):
         })
         
     except Exception as e:
-        logger.error(f"Failed to get comments: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get comments")
 
 
 # ============== Interview Endpoints ==============
@@ -2202,9 +2122,6 @@ def interview_agent():
         data = request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
-        agent_id = data.get('agent_id')
-        prompt = data.get('prompt')
-        platform = data.get('platform')  # Optional: twitter/reddit/None
         timeout = _clamp_timeout(data.get('timeout', 60), 60)
         
         if not simulation_id:
@@ -2213,24 +2130,15 @@ def interview_agent():
                 "error": "Please provide simulation_id"
             }), 400
         
-        if agent_id is None:
+        if data.get('agent_id') is None:
             return jsonify({
                 "success": False,
                 "error": "Please provide agent_id"
             }), 400
-        
-        if not prompt:
-            return jsonify({
-                "success": False,
-                "error": "Please provide prompt (interview question)"
-            }), 400
-        
-        # Validate platform parameter
-        if platform and platform not in ("twitter", "reddit"):
-            return jsonify({
-                "success": False,
-                "error": "platform parameter can only be 'twitter' or 'reddit'"
-            }), 400
+        agent_id = _parse_agent_id(data.get('agent_id'))
+        prompt = require_text(data.get('prompt'), 'prompt (interview question)', max_chars=MAX_PROMPT_CHARS)
+        # Optional: twitter/reddit/None
+        platform = parse_platform(data.get('platform'), QUERY_PLATFORMS)
         
         # Check environment status
         if not SimulationRunner.check_env_alive(simulation_id):
@@ -2268,12 +2176,7 @@ def interview_agent():
         }), 504
         
     except Exception as e:
-        logger.error(f"Interview failed: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Interview failed")
 
 
 @simulation_bp.route('/interview/batch', methods=['POST'])
@@ -2325,7 +2228,7 @@ def interview_agents_batch():
 
         simulation_id = data.get('simulation_id')
         interviews = data.get('interviews')
-        platform = data.get('platform')  # Optional: twitter/reddit/None
+        platform = parse_platform(data.get('platform'), QUERY_PLATFORMS)  # Optional: twitter/reddit/None
         timeout = _clamp_timeout(data.get('timeout', 120), 120)
 
         if not simulation_id:
@@ -2340,15 +2243,13 @@ def interview_agents_batch():
                 "error": "Please provide interviews (interview list)"
             }), 400
 
-        # Validate platform parameter
-        if platform and platform not in ("twitter", "reddit"):
-            return jsonify({
-                "success": False,
-                "error": "platform parameter can only be 'twitter' or 'reddit'"
-            }), 400
+        if len(interviews) > MAX_BATCH_INTERVIEWS:
+            raise InputError(f"At most {MAX_BATCH_INTERVIEWS} interviews per batch")
 
         # Validate each interview item
         for i, interview in enumerate(interviews):
+            if not isinstance(interview, dict):
+                raise InputError(f"Interview list item {i+1} must be an object")
             if 'agent_id' not in interview:
                 return jsonify({
                     "success": False,
@@ -2359,13 +2260,10 @@ def interview_agents_batch():
                     "success": False,
                     "error": f"Interview list item {i+1} is missing prompt"
                 }), 400
+            _parse_agent_id(interview.get('agent_id'), f"Interview list item {i+1} agent_id")
+            require_text(interview.get('prompt'), f"Interview list item {i+1} prompt", max_chars=MAX_PROMPT_CHARS)
             # Validate each item's platform (if present)
-            item_platform = interview.get('platform')
-            if item_platform and item_platform not in ("twitter", "reddit"):
-                return jsonify({
-                    "success": False,
-                    "error": f"Interview list item {i+1} platform can only be 'twitter' or 'reddit'"
-                }), 400
+            parse_platform(interview.get('platform'), QUERY_PLATFORMS, name=f"Interview list item {i+1} platform")
 
         # Check environment status
         if not SimulationRunner.check_env_alive(simulation_id):
@@ -2406,12 +2304,7 @@ def interview_agents_batch():
         }), 504
 
     except Exception as e:
-        logger.error(f"Batch Interview failed: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Batch Interview failed")
 
 
 @simulation_bp.route('/interview/all', methods=['POST'])
@@ -2451,8 +2344,7 @@ def interview_all_agents():
         data = request.get_json() or {}
 
         simulation_id = data.get('simulation_id')
-        prompt = data.get('prompt')
-        platform = data.get('platform')  # Optional: twitter/reddit/None
+        platform = parse_platform(data.get('platform'), QUERY_PLATFORMS)  # Optional: twitter/reddit/None
         timeout = _clamp_timeout(data.get('timeout', 180), 180)
 
         if not simulation_id:
@@ -2461,18 +2353,7 @@ def interview_all_agents():
                 "error": "Please provide simulation_id"
             }), 400
 
-        if not prompt:
-            return jsonify({
-                "success": False,
-                "error": "Please provide prompt (interview question)"
-            }), 400
-
-        # Validate platform parameter
-        if platform and platform not in ("twitter", "reddit"):
-            return jsonify({
-                "success": False,
-                "error": "platform parameter can only be 'twitter' or 'reddit'"
-            }), 400
+        prompt = require_text(data.get('prompt'), 'prompt (interview question)', max_chars=MAX_PROMPT_CHARS)
 
         # Check environment status
         if not SimulationRunner.check_env_alive(simulation_id):
@@ -2509,12 +2390,7 @@ def interview_all_agents():
         }), 504
 
     except Exception as e:
-        logger.error(f"Global Interview failed: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Global Interview failed")
 
 
 @simulation_bp.route('/interview/history', methods=['POST'])
@@ -2555,9 +2431,10 @@ def get_interview_history():
         data = request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
-        platform = data.get('platform')  # Not specified: returns history from both platforms
-        agent_id = data.get('agent_id')
-        limit = data.get('limit', 100)
+        # Not specified: returns history from both platforms
+        platform = parse_platform(data.get('platform'), QUERY_PLATFORMS)
+        agent_id = parse_int(data.get('agent_id'), 'agent_id', minimum=0)
+        limit = parse_int(data.get('limit'), 'limit', default=100, minimum=1, maximum=1000)
         
         if not simulation_id:
             return jsonify({
@@ -2581,12 +2458,7 @@ def get_interview_history():
         })
 
     except Exception as e:
-        logger.error(f"Failed to get Interview history: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get Interview history")
 
 
 @simulation_bp.route('/env-status', methods=['POST'])
@@ -2646,12 +2518,7 @@ def get_env_status():
         })
 
     except Exception as e:
-        logger.error(f"Failed to get environment status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to get environment status")
 
 
 @simulation_bp.route('/close-env', methods=['POST'])
@@ -2702,7 +2569,7 @@ def close_simulation_env():
         state = manager.get_simulation(simulation_id)
         if state:
             state.status = SimulationStatus.COMPLETED
-            manager._save_simulation_state(state)
+            manager.save_simulation_state(state)
         
         return jsonify({
             "success": result.get("success", False),
@@ -2716,9 +2583,4 @@ def close_simulation_env():
         }), 400
         
     except Exception as e:
-        logger.error(f"Failed to close environment: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        return error_response(e, "Failed to close environment")

@@ -89,29 +89,57 @@ class PlatformActionLogger:
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
-    def log_simulation_start(self, config: Dict[str, Any]):
+    def log_simulation_start(self, config: Dict[str, Any], total_rounds: Optional[int] = None):
         """Log simulation start"""
-        entry = {
+        if total_rounds is None:
+            time_config = config.get("time_config", {})
+            total_rounds = (time_config.get("total_simulation_hours", 72) * 60) // max(
+                time_config.get("minutes_per_round", 30), 1)
+        self._write({
             "timestamp": datetime.now().isoformat(),
             "event_type": "simulation_start",
             "platform": self.platform,
-            "total_rounds": config.get("time_config", {}).get("total_simulation_hours", 72) * 2,
+            "total_rounds": total_rounds,
             "agents_count": len(config.get("agent_configs", [])),
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        })
 
     def log_simulation_end(self, total_rounds: int, total_actions: int):
-        """Log simulation end"""
-        entry = {
+        """Log a successful simulation end (every configured round ran)."""
+        self._write({
             "timestamp": datetime.now().isoformat(),
             "event_type": "simulation_end",
             "platform": self.platform,
             "total_rounds": total_rounds,
             "total_actions": total_actions,
-        }
+        })
 
+    def log_simulation_stopped(self, rounds_completed: int, total_rounds: int,
+                               total_actions: int, reason: str = "shutdown"):
+        """Log an interrupted run (shutdown signal). Never counts as completion."""
+        self._write({
+            "timestamp": datetime.now().isoformat(),
+            "event_type": "simulation_stopped",
+            "platform": self.platform,
+            "rounds_completed": rounds_completed,
+            "total_rounds": total_rounds,
+            "total_actions": total_actions,
+            "reason": reason,
+        })
+
+    def log_simulation_failed(self, rounds_completed: int, total_rounds: int,
+                              total_actions: int, error: str):
+        """Log a run that aborted on an error. Never counts as completion."""
+        self._write({
+            "timestamp": datetime.now().isoformat(),
+            "event_type": "simulation_failed",
+            "platform": self.platform,
+            "rounds_completed": rounds_completed,
+            "total_rounds": total_rounds,
+            "total_actions": total_actions,
+            "error": error,
+        })
+
+    def _write(self, entry: Dict[str, Any]):
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
@@ -191,112 +219,3 @@ class SimulationLogManager:
 
     def debug(self, message: str):
         self.log(message, "debug")
-
-
-# ============ Legacy Interface Compatibility ============
-
-class ActionLogger:
-    """
-    Action Logger (legacy interface compatibility)
-    Consider using SimulationLogManager instead
-    """
-
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-        self._ensure_dir()
-
-    def _ensure_dir(self):
-        log_dir = os.path.dirname(self.log_path)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-
-    def log_action(
-        self,
-        round_num: int,
-        platform: str,
-        agent_id: int,
-        agent_name: str,
-        action_type: str,
-        action_args: Optional[Dict[str, Any]] = None,
-        result: Optional[str] = None,
-        success: bool = True
-    ):
-        entry = {
-            "round": round_num,
-            "timestamp": datetime.now().isoformat(),
-            "platform": platform,
-            "agent_id": agent_id,
-            "agent_name": agent_name,
-            "action_type": action_type,
-            "action_args": action_args or {},
-            "result": result,
-            "success": success,
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-
-    def log_round_start(self, round_num: int, simulated_hour: int, platform: str):
-        entry = {
-            "round": round_num,
-            "timestamp": datetime.now().isoformat(),
-            "platform": platform,
-            "event_type": "round_start",
-            "simulated_hour": simulated_hour,
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-
-    def log_round_end(self, round_num: int, actions_count: int, platform: str):
-        entry = {
-            "round": round_num,
-            "timestamp": datetime.now().isoformat(),
-            "platform": platform,
-            "event_type": "round_end",
-            "actions_count": actions_count,
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-
-    def log_simulation_start(self, platform: str, config: Dict[str, Any]):
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "platform": platform,
-            "event_type": "simulation_start",
-            "total_rounds": config.get("time_config", {}).get("total_simulation_hours", 72) * 2,
-            "agents_count": len(config.get("agent_configs", [])),
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-
-    def log_simulation_end(self, platform: str, total_rounds: int, total_actions: int):
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "platform": platform,
-            "event_type": "simulation_end",
-            "total_rounds": total_rounds,
-            "total_actions": total_actions,
-        }
-
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-
-
-# Global logger instance (legacy interface compatibility)
-_global_logger: Optional[ActionLogger] = None
-
-
-def get_logger(log_path: Optional[str] = None) -> ActionLogger:
-    """Get global logger instance (legacy interface compatibility)"""
-    global _global_logger
-
-    if log_path:
-        _global_logger = ActionLogger(log_path)
-
-    if _global_logger is None:
-        _global_logger = ActionLogger("actions.jsonl")
-
-    return _global_logger

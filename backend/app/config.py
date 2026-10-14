@@ -4,6 +4,7 @@ Loads all configuration from the .env file in the project root directory
 """
 
 import os
+import secrets
 from dotenv import load_dotenv
 
 # Load the .env file from the project root directory
@@ -24,9 +25,9 @@ class Config:
     """Flask Configuration Class"""
 
     # Flask configuration
-    # SECRET_KEY must be provided via the environment in any real deployment;
-    # the development fallback is deliberately obvious so a missing key is caught.
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-only-insecure-change-me')
+    # Nothing currently uses Flask sessions, but never fall back to a guessable
+    # constant: an unset SECRET_KEY gets a random per-process value.
+    SECRET_KEY = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
     # Debug defaults OFF. The Werkzeug interactive debugger is remote code
     # execution when reachable, so it must be opted into explicitly and never
     # enabled on a public host.
@@ -53,9 +54,24 @@ class Config:
     # the full API stays open (development / trusted-network behavior).
     ADMIN_API_KEY = os.environ.get('ADMIN_API_KEY')
 
+    # Network exposure. The server binds to loopback unless FLASK_HOST says
+    # otherwise (the Docker image sets 0.0.0.0 explicitly). The frontend talks
+    # to the API same-origin (Vite proxy in dev, same server in production), so
+    # no cross-origin access is granted unless CORS_ORIGINS lists origins
+    # (comma-separated, e.g. "https://app.example.com").
+    FLASK_HOST = os.environ.get('FLASK_HOST', '127.0.0.1')
+    CORS_ORIGINS = [
+        o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(',') if o.strip()
+    ]
+
+    # Every mutating /api request must carry this header (value "1"). Browsers
+    # cannot attach a custom header cross-origin without a CORS preflight, which
+    # the restricted CORS policy rejects, so this blocks CSRF from other sites.
+    CLIENT_HEADER = 'X-SimSend-Client'
+
     # File upload configuration
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
-    UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')
+    UPLOAD_FOLDER = os.path.normpath(os.path.join(os.path.dirname(__file__), '../uploads'))
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing configuration
@@ -64,7 +80,17 @@ class Config:
 
     # OASIS simulation configuration
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
-    OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
+    # Single source of truth for on-disk locations.
+    OASIS_SIMULATION_DATA_DIR = os.path.join(UPLOAD_FOLDER, 'simulations')
+    REPORTS_DIR = os.path.join(UPLOAD_FOLDER, 'reports')
+    TASKS_DIR = os.path.join(UPLOAD_FOLDER, 'tasks')
+
+    # Resource limits for client-supplied parameters.
+    MAX_CONCURRENT_SIMULATIONS = max(1, int(os.environ.get('SIMSEND_MAX_CONCURRENT_SIMULATIONS', '2')))
+    MAX_SIMULATION_ROUNDS = int(os.environ.get('SIMSEND_MAX_SIMULATION_ROUNDS', '1000'))
+    MAX_PARALLEL_PROFILE_COUNT = int(os.environ.get('SIMSEND_MAX_PARALLEL_PROFILES', '20'))
+    MAX_CHAT_HISTORY_MESSAGES = 50
+    MAX_CHAT_MESSAGE_CHARS = 20000
 
     # OASIS platform available actions configuration
     OASIS_TWITTER_ACTIONS = [

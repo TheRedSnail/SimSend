@@ -4,9 +4,16 @@ services:
     container_name: mirofish
     env_file:
       - .env
+    environment:
+      # Inside the container the server must listen on all interfaces; the
+      # published port below is what controls who can reach it.
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: 5001
     ports:
-      - "${FRONTEND_PORT:-3000}:${FRONTEND_PORT:-3000}"
-      - "${FLASK_PORT:-5001}:${FLASK_PORT:-5001}"
+      # Bound to loopback by default: the API has no user accounts, so only
+      # expose it more widely behind a reverse proxy and with ADMIN_API_KEY set.
+      - "${BIND_ADDRESS:-127.0.0.1}:${FLASK_PORT:-5001}:5001"
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
+      - ./backend/logs:/app/backend/logs

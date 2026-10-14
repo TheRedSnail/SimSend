@@ -8,12 +8,16 @@ import os
 import json
 import uuid
 import shutil
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from enum import Enum
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from ..config import Config
-from ..utils.atomic_io import atomic_write_json
+from ..utils.atomic_io import atomic_write_json, atomic_write_text
+
+_UNSET = object()
 
 
 class ProjectStatus(str, Enum):
@@ -106,6 +110,17 @@ class ProjectManager:
     # Project storage root directory
     PROJECTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'projects')
 
+    # Serializes read-modify-write cycles on project.json (request threads and
+    # background jobs both update projects).
+    _write_lock = threading.RLock()
+
+    @classmethod
+    @contextmanager
+    def locked(cls):
+        """Hold the project write lock for an atomic check-and-set."""
+        with cls._write_lock:
+            yield
+
     @classmethod
     def _ensure_projects_dir(cls):
         """Ensure the projects directory exists"""
@@ -168,12 +183,40 @@ class ProjectManager:
 
     @classmethod
     def save_project(cls, project: Project) -> None:
-        """Save project metadata"""
+        """Save project metadata.
+
+        Raises ``FileNotFoundError`` if the project directory no longer exists:
+        a stale writer (e.g. a background job for a project deleted meanwhile)
+        must not resurrect it.
+        """
         project.updated_at = datetime.now().isoformat()
         meta_path = cls._get_project_meta_path(project.project_id)
 
         # Atomic write so a concurrent get_project() never reads a torn file.
-        atomic_write_json(meta_path, project.to_dict())
+        with cls._write_lock:
+            atomic_write_json(meta_path, project.to_dict(), create_dirs=False)
+
+    @classmethod
+    def update_project(cls, project_id: str, mutate, *, expected_build_task_id=_UNSET) -> Optional[Project]:
+        """Reload a project, apply ``mutate(project)`` and save it, atomically.
+
+        Returns ``None`` (without saving) when the project was deleted, or when
+        ``expected_build_task_id`` is given and no longer matches — i.e. this
+        caller's graph build has been superseded by a reset or a newer build.
+        """
+        with cls._write_lock:
+            project = cls.get_project(project_id)
+            if project is None:
+                return None
+            if (expected_build_task_id is not _UNSET
+                    and project.graph_build_task_id != expected_build_task_id):
+                return None
+            mutate(project)
+            try:
+                cls.save_project(project)
+            except FileNotFoundError:
+                return None
+            return project
 
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Project]:
@@ -211,7 +254,11 @@ class ProjectManager:
 
         projects = []
         for project_id in os.listdir(cls.PROJECTS_DIR):
-            project = cls.get_project(project_id)
+            try:
+                project = cls.get_project(project_id)
+            except (OSError, ValueError, KeyError):
+                # One unreadable project must not break the whole listing.
+                continue
             if project:
                 projects.append(project)
 
@@ -219,6 +266,30 @@ class ProjectManager:
         projects.sort(key=lambda p: p.created_at, reverse=True)
 
         return projects[:limit]
+
+    @classmethod
+    def recover_interrupted_builds(cls) -> int:
+        """Mark projects left in GRAPH_BUILDING by a previous process as failed.
+
+        Graph builds run in-process, so after a restart nothing is building
+        anymore; without this the project stays "building" forever and every
+        rebuild request is rejected. FAILED is a retryable state.
+        """
+        recovered = 0
+        if not os.path.isdir(cls.PROJECTS_DIR):
+            return 0
+        for project_id in os.listdir(cls.PROJECTS_DIR):
+            def mark_failed(project):
+                project.status = ProjectStatus.FAILED
+                project.error = "Graph build was interrupted by a server restart. Please rebuild the graph."
+            try:
+                project = cls.get_project(project_id)
+                if project and project.status == ProjectStatus.GRAPH_BUILDING:
+                    if cls.update_project(project_id, mark_failed):
+                        recovered += 1
+            except (OSError, ValueError, KeyError):
+                continue
+        return recovered
 
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
@@ -233,10 +304,10 @@ class ProjectManager:
         """
         project_dir = cls._get_project_dir(project_id)
 
-        if not os.path.exists(project_dir):
-            return False
-
-        shutil.rmtree(project_dir)
+        with cls._write_lock:
+            if not os.path.exists(project_dir):
+                return False
+            shutil.rmtree(project_dir)
         return True
 
     @classmethod
@@ -277,8 +348,7 @@ class ProjectManager:
     def save_extracted_text(cls, project_id: str, text: str) -> None:
         """Save extracted text"""
         text_path = cls._get_project_text_path(project_id)
-        with open(text_path, 'w', encoding='utf-8') as f:
-            f.write(text)
+        atomic_write_text(text_path, text, create_dirs=False)
 
     @classmethod
     def get_extracted_text(cls, project_id: str) -> Optional[str]:

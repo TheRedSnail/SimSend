@@ -2,7 +2,7 @@ name: Build and push Docker image
 
 on:
   push:
-    tags: ["*"]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -15,9 +15,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,9 +32,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/mirofish
           tags: |
-            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest
+            # Only release tags (vX.Y.Z, no pre-release suffix) move "latest".
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v5

@@ -1,7 +1,7 @@
 {
   "name": "mirofish",
   "version": "0.1.0",
-  "description": "MiroFish - 简洁通用的群体智能引擎，预测万物",
+  "description": "SimSend (MiroFish) - marketing campaign audience simulation engine",
   "scripts": {
     "setup": "npm install && cd frontend && npm install",
     "setup:backend": "cd backend && uv sync",
@@ -9,13 +9,16 @@
     "dev": "concurrently --kill-others -n \"backend,frontend\" -c \"green,cyan\" \"npm run backend\" \"npm run frontend\"",
     "backend": "cd backend && uv run python run.py",
     "frontend": "cd frontend && npm run dev",
-    "build": "cd frontend && npm run build"
+    "build": "cd frontend && npm run build",
+    "start": "npm run build && cd backend && uv run python wsgi.py",
+    "test": "cd backend && uv run pytest && cd ../frontend && npm test",
+    "lint": "cd frontend && npm run lint"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "license": "AGPL-3.0"
 }

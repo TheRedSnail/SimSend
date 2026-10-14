@@ -1,31 +1,43 @@
-FROM python:3.11
+# ---- Stage 1: build the frontend ----
+FROM node:20-slim AS frontend
 
-# 安装 Node.js （满足 >=18）及必要工具
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl \
-  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-  && apt-get install -y nodejs \
-  && rm -rf /var/lib/apt/lists/*
-  
-# 从 uv 官方镜像复制 uv
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Stage 2: runtime (backend serves the API and the built frontend) ----
+FROM python:3.11-slim
+
 COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
 
-WORKDIR /app
+ENV PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/backend/.venv/bin:$PATH" \
+    FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5001 \
+    FRONTEND_DIST_DIR=/app/frontend/dist
 
-# 先复制依赖描述文件以利用缓存
-COPY package.json package-lock.json ./
-COPY frontend/package.json frontend/package-lock.json ./frontend/
-COPY backend/pyproject.toml backend/uv.lock ./backend/
+WORKDIR /app/backend
 
-# 安装依赖（Node + Python）
-RUN npm ci \
-  && npm ci --prefix frontend \
-  && cd backend && uv sync --frozen
+# Dependencies first for layer caching
+COPY backend/pyproject.toml backend/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# 复制项目源码
-COPY . .
+COPY backend/ ./
+COPY --from=frontend /app/frontend/dist /app/frontend/dist
 
-EXPOSE 3000 5001
+RUN useradd --create-home --uid 1000 app \
+  && mkdir -p uploads logs \
+  && chown -R app:app uploads logs
+USER app
 
-# 同时启动前后端（开发模式）
-CMD ["npm", "run", "dev"]
+EXPOSE 5001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"FLASK_PORT\", \"5001\")}/health', timeout=4)"
+
+# waitress, serving the API and the built frontend (see backend/wsgi.py)
+CMD ["python", "wsgi.py"]

@@ -12,6 +12,7 @@ Step-by-step generation strategy to avoid overly long single-generation failures
 """
 
 import json
+import time
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Callable
@@ -22,6 +23,8 @@ from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.json_repair import repair_truncated_json
+from ..utils.retry import is_transient_error
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -233,6 +236,7 @@ class SimulationConfigGenerator:
     EVENT_CONFIG_CONTEXT_LENGTH = 8000   # Event config
     ENTITY_SUMMARY_LENGTH = 300          # Entity summary
     AGENT_SUMMARY_LENGTH = 300           # Agent config entity summary
+    LLM_TIMEOUT_SECONDS = 180.0          # per request; config batches can be long
     ENTITIES_PER_TYPE_DISPLAY = 20       # Entities displayed per type
 
     def __init__(
@@ -248,9 +252,13 @@ class SimulationConfigGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
+        # Explicit timeout, and no SDK-level retries: _call_llm_with_retry
+        # already retries, so stacking both multiplies a hung call.
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=self.LLM_TIMEOUT_SECONDS,
+            max_retries=0,
         )
 
     def generate_config(
@@ -480,13 +488,13 @@ class SimulationConfigGenerator:
                     # No max_tokens set, let LLM generate freely
                 )
 
-                content = response.choices[0].message.content
+                content = response.choices[0].message.content or ""
                 finish_reason = response.choices[0].finish_reason
 
                 # Check if truncated
                 if finish_reason == 'length':
                     logger.warning(f"LLM output truncated (attempt {attempt+1})")
-                    content = self._fix_truncated_json(content)
+                    content = repair_truncated_json(content)
 
                 # Try to parse JSON
                 try:
@@ -504,35 +512,18 @@ class SimulationConfigGenerator:
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
+                if not is_transient_error(e):
+                    break  # auth/config/bad-request errors won't fix themselves
                 time.sleep(2 * (attempt + 1))
 
         raise last_error or Exception("LLM call failed")
-
-    def _fix_truncated_json(self, content: str) -> str:
-        """Fix truncated JSON"""
-        content = content.strip()
-
-        # Count unclosed brackets
-        open_braces = content.count('{') - content.count('}')
-        open_brackets = content.count('[') - content.count(']')
-
-        # Check for unclosed strings
-        if content and content[-1] not in '",}]':
-            content += '"'
-
-        # Close brackets
-        content += ']' * open_brackets
-        content += '}' * open_braces
-
-        return content
 
     def _try_fix_config_json(self, content: str) -> Optional[Dict[str, Any]]:
         """Try to fix configuration JSON"""
         import re
 
         # Fix truncation
-        content = self._fix_truncated_json(content)
+        content = repair_truncated_json(content)
 
         # Extract JSON portion
         json_match = re.search(r'\{[\s\S]*\}', content)
