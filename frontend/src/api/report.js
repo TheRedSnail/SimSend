@@ -5,7 +5,7 @@ import service, { requestWithRetry } from './index'
  * @param {Object} data - { simulation_id, force_regenerate? }
  */
 export const generateReport = (data) => {
-  return requestWithRetry(() => service.post('/api/report/generate', data), 3, 1000)
+  return service.post('/api/report/generate', data)
 }
 
 /**
@@ -39,7 +39,7 @@ export const getConsoleLog = (reportId, fromLine = 0) => {
  * @param {string} reportId
  */
 export const getReport = (reportId) => {
-  return service.get(`/api/report/${reportId}`)
+  return requestWithRetry(() => service.get(`/api/report/${reportId}`))
 }
 
 /**
@@ -47,5 +47,5 @@ export const getReport = (reportId) => {
  * @param {Object} data - { simulation_id, message, chat_history? }
  */
 export const chatWithReport = (data) => {
-  return requestWithRetry(() => service.post('/api/report/chat', data), 3, 1000)
+  return service.post('/api/report/chat', data)
 }

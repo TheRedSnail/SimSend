@@ -223,7 +223,6 @@ const files = ref([])
 
 // State
 const loading = ref(false)
-const error = ref('')
 const isDragOver = ref(false)
 
 // File input ref

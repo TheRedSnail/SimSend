@@ -244,7 +244,6 @@ const getCardStyle = (index) => {
     // Expanded state: grid layout
     const transition = 'transform 700ms cubic-bezier(0.23, 1, 0.32, 1), opacity 700ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 0.3s ease, border-color 0.3s ease'
 
-    const col = index % CARDS_PER_ROW
     const row = Math.floor(index / CARDS_PER_ROW)
     
     // Calculate current row's card count for centering
@@ -538,14 +537,17 @@ watch(() => route.path, (newPath) => {
   }
 })
 
+let isUnmounted = false
+
 onMounted(async () => {
   // Ensure DOM rendering is complete before loading data
   await nextTick()
   await loadHistory()
+  if (isUnmounted) return
   
   // Initialize observer after DOM rendering
   setTimeout(() => {
-    initObserver()
+    if (!isUnmounted) initObserver()
   }, 100)
 })
 
@@ -555,6 +557,7 @@ onActivated(() => {
 })
 
 onUnmounted(() => {
+  isUnmounted = true
   // Cleanup Intersection Observer
   if (observer) {
     observer.disconnect()

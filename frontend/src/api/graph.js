@@ -6,16 +6,14 @@ import service, { requestWithRetry } from './index'
  * @returns {Promise}
  */
 export function generateOntology(formData) {
-  return requestWithRetry(() => 
-    service({
-      url: '/api/graph/ontology/generate',
-      method: 'post',
-      data: formData,
-      headers: {
-        'Content-Type': 'multipart/form-data'
-      }
-    })
-  )
+  return service({
+    url: '/api/graph/ontology/generate',
+    method: 'post',
+    data: formData,
+    headers: {
+      'Content-Type': 'multipart/form-data'
+    }
+  })
 }
 
 /**
@@ -24,13 +22,11 @@ export function generateOntology(formData) {
  * @returns {Promise}
  */
 export function buildGraph(data) {
-  return requestWithRetry(() =>
-    service({
-      url: '/api/graph/build',
-      method: 'post',
-      data
-    })
-  )
+  return service({
+    url: '/api/graph/build',
+    method: 'post',
+    data
+  })
 }
 
 /**
@@ -51,10 +47,10 @@ export function getTaskStatus(taskId) {
  * @returns {Promise}
  */
 export function getGraphData(graphId) {
-  return service({
+  return requestWithRetry(() => service({
     url: `/api/graph/data/${graphId}`,
     method: 'get'
-  })
+  }))
 }
 
 /**
@@ -63,8 +59,8 @@ export function getGraphData(graphId) {
  * @returns {Promise}
  */
 export function getProject(projectId) {
-  return service({
+  return requestWithRetry(() => service({
     url: `/api/graph/project/${projectId}`,
     method: 'get'
-  })
+  }))
 }

@@ -91,7 +91,23 @@
       </div>
 
       <div class="action-controls">
-        <button 
+        <button
+          v-if="phase === 1"
+          class="action-btn ghost"
+          :disabled="isStopping"
+          @click="handleStopSimulation"
+        >
+          {{ isStopping ? 'Stopping...' : 'Stop simulation' }}
+        </button>
+        <template v-if="canRestart">
+          <div v-if="confirmingRestart" class="restart-confirm" role="group" aria-label="Confirm restart">
+            <span class="restart-confirm-text">Restart clears this run's results. Continue?</span>
+            <button class="action-btn danger" @click="confirmRestart">Restart</button>
+            <button class="action-btn ghost" @click="cancelRestart">Cancel</button>
+          </div>
+          <button v-else class="action-btn ghost" @click="requestRestart">Restart simulation</button>
+        </template>
+        <button
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
           @click="handleNextStep"
@@ -101,6 +117,10 @@
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
         </button>
       </div>
+    </div>
+
+    <div v-if="runBanner" class="run-banner" :class="runBanner.kind" role="status">
+      {{ runBanner.text }}
     </div>
 
     <!-- Main Content: Dual Timeline -->
@@ -286,7 +306,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   startSimulation,
@@ -295,6 +315,7 @@ import {
   getRunStatusDetail
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import { usePolling, useDisposed } from '../composables/usePolling'
 
 const props = defineProps({
   simulationId: String,
@@ -311,13 +332,20 @@ const props = defineProps({
 const emit = defineEmits(['go-back', 'next-step', 'add-log', 'update-status'])
 
 const router = useRouter()
+const isDisposed = useDisposed()
+
+// Runner states that mean a run is (or is about to be) in progress
+const ACTIVE_STATUSES = ['starting', 'running', 'paused', 'stopping']
 
 // State
 const isGeneratingReport = ref(false)
-const phase = ref(0) // 0: Not started, 1: Running, 2: Completed
+const phase = ref(0) // 0: Not started, 1: Running, 2: Finished (completed/stopped), 3: Failed
+const endReason = ref(null) // 'completed' | 'stopped' | 'failed' once the run is over
 const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
+const runError = ref(null)
+const confirmingRestart = ref(false)
 const runStatus = ref({})
 const allActions = ref([]) // All actions (incremental)
 const actionIds = ref(new Set()) // Action IDs for deduplication
@@ -336,6 +364,18 @@ const twitterActionsCount = computed(() => {
 
 const redditActionsCount = computed(() => {
   return allActions.value.filter(a => a.platform === 'reddit').length
+})
+
+// The restart control is offered only once nothing is running.
+const canRestart = computed(() => {
+  return !isStarting.value && (phase.value === 2 || phase.value === 3 || !!startError.value)
+})
+
+const runBanner = computed(() => {
+  if (startError.value) return { kind: 'error', text: `Could not start simulation: ${startError.value}` }
+  if (endReason.value === 'failed') return { kind: 'error', text: `Simulation failed: ${runError.value || 'unknown error'}` }
+  if (endReason.value === 'stopped') return { kind: 'warn', text: 'Simulation was stopped before finishing all rounds. Results may be partial.' }
+  return null
 })
 
 // Format simulated elapsed time (calculated from rounds and minutes per round)
@@ -365,6 +405,8 @@ const addLog = (msg) => {
 // Reset all state (for restarting simulation)
 const resetAllState = () => {
   phase.value = 0
+  endReason.value = null
+  runError.value = null
   runStatus.value = {}
   allActions.value = []
   actionIds.value = new Set()
@@ -373,11 +415,57 @@ const resetAllState = () => {
   startError.value = null
   isStarting.value = false
   isStopping.value = false
+  confirmingRestart.value = false
   stopPolling()  // Stop any existing polling
 }
 
-// Start simulation
-const doStartSimulation = async () => {
+const startPolling = () => {
+  statusPoller.start()
+  detailPoller.start()
+}
+
+// On mount, look at the existing run before doing anything: only a simulation
+// that has never been started is started automatically. Refreshing the page or
+// navigating back must never restart (and wipe) an existing run.
+const initRun = async () => {
+  if (!props.simulationId) return
+  try {
+    const res = await getRunStatus(props.simulationId)
+    if (isDisposed()) return
+    const data = res.data || {}
+    const status = data.runner_status || 'idle'
+
+    if (status === 'idle') {
+      await doStartSimulation({ force: false })
+      return
+    }
+
+    runStatus.value = data
+    prevTwitterRound.value = data.twitter_current_round || 0
+    prevRedditRound.value = data.reddit_current_round || 0
+
+    if (ACTIVE_STATUSES.includes(status)) {
+      addLog(`Simulation already ${status}, resuming monitor`)
+      phase.value = 1
+      emit('update-status', 'processing')
+      startPolling()
+    } else {
+      // completed / stopped / failed: show the results, don't restart
+      addLog(`Loaded existing simulation run (${status})`)
+      applyFinalStatus(data)
+      await fetchRunStatusDetail()
+    }
+  } catch (err) {
+    if (isDisposed()) return
+    startError.value = err.message
+    addLog(`Failed to load simulation status: ${err.message}`)
+    emit('update-status', 'error')
+  }
+}
+
+// Start simulation. `force` restarts an existing run and clears its logs, so it
+// is only ever sent from the explicit "Restart" confirmation.
+const doStartSimulation = async ({ force = false } = {}) => {
   if (!props.simulationId) {
     addLog('Error: Missing simulationId')
     return
@@ -387,71 +475,79 @@ const doStartSimulation = async () => {
   resetAllState()
 
   isStarting.value = true
-  startError.value = null
-  addLog('Starting dual-platform parallel simulation...')
+  addLog(force ? 'Restarting dual-platform parallel simulation...' : 'Starting dual-platform parallel simulation...')
   emit('update-status', 'processing')
-  
+
   try {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // Force restart
+      force,
       enable_graph_memory_update: true  // Enable dynamic graph memory update
     }
-    
+
     if (props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(`Setting max simulation rounds: ${props.maxRounds}`)
     }
 
     addLog('Dynamic graph memory update mode enabled')
-    
+
     const res = await startSimulation(params)
-    
-    if (res.success && res.data) {
-      if (res.data.force_restarted) {
-        addLog('Old simulation logs cleared, restarting simulation')
-      }
-      addLog('Simulation engine started successfully')
-      addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
-      
-      phase.value = 1
-      runStatus.value = res.data
-      
-      startStatusPolling()
-      startDetailPolling()
-    } else {
-      startError.value = res.error || 'Start failed'
-      addLog(`Start failed: ${res.error || 'Unknown error'}`)
-      emit('update-status', 'error')
+    if (isDisposed()) return
+
+    if (res.data.force_restarted) {
+      addLog('Old simulation logs cleared, restarting simulation')
     }
+    addLog('Simulation engine started successfully')
+    addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
+
+    phase.value = 1
+    runStatus.value = res.data
+
+    startPolling()
   } catch (err) {
+    if (isDisposed()) return
     startError.value = err.message
-    addLog(`Start error: ${err.message}`)
+    if (err.status === 409 || err.status === 429) {
+      addLog(`Simulation not started (server busy): ${err.message}`)
+    } else {
+      addLog(`Start error: ${err.message}`)
+    }
     emit('update-status', 'error')
   } finally {
     isStarting.value = false
   }
 }
 
+const requestRestart = () => {
+  confirmingRestart.value = true
+}
+
+const cancelRestart = () => {
+  confirmingRestart.value = false
+}
+
+const confirmRestart = () => {
+  confirmingRestart.value = false
+  doStartSimulation({ force: true })
+}
+
 // Stop simulation
 const handleStopSimulation = async () => {
   if (!props.simulationId) return
-  
+
   isStopping.value = true
   addLog('Stopping simulation...')
-  
+
   try {
-    const res = await stopSimulation({ simulation_id: props.simulationId })
-    
-    if (res.success) {
-      addLog('Simulation stopped')
-      phase.value = 2
-      stopPolling()
-      emit('update-status', 'completed')
-    } else {
-      addLog(`Stop failed: ${res.error || 'Unknown error'}`)
-    }
+    await stopSimulation({ simulation_id: props.simulationId })
+    if (isDisposed()) return
+    addLog('Simulation stopped')
+    stopPolling()
+    phase.value = 2
+    endReason.value = 'stopped'
+    emit('update-status', 'completed')
   } catch (err) {
     addLog(`Stop error: ${err.message}`)
   } finally {
@@ -459,133 +555,122 @@ const handleStopSimulation = async () => {
   }
 }
 
-// Poll status
-let statusTimer = null
-let detailTimer = null
-
-const startStatusPolling = () => {
-  statusTimer = setInterval(fetchRunStatus, 2000)
-}
-
-const startDetailPolling = () => {
-  detailTimer = setInterval(fetchRunStatusDetail, 3000)
-}
-
-const stopPolling = () => {
-  if (statusTimer) {
-    clearInterval(statusTimer)
-    statusTimer = null
-  }
-  if (detailTimer) {
-    clearInterval(detailTimer)
-    detailTimer = null
-  }
-}
-
 // Track previous round for each platform to detect changes and output logs
 const prevTwitterRound = ref(0)
 const prevRedditRound = ref(0)
 
-const fetchRunStatus = async () => {
-  if (!props.simulationId) return
-  
-  try {
-    const res = await getRunStatus(props.simulationId)
-    
-    if (res.success && res.data) {
-      const data = res.data
-      
-      runStatus.value = data
-      
-      // Detect round changes for each platform and output logs
-      if (data.twitter_current_round > prevTwitterRound.value) {
-        addLog(`[Plaza] R${data.twitter_current_round}/${data.total_rounds} | T:${data.twitter_simulated_hours || 0}h | A:${data.twitter_actions_count}`)
-        prevTwitterRound.value = data.twitter_current_round
-      }
-      
-      if (data.reddit_current_round > prevRedditRound.value) {
-        addLog(`[Community] R${data.reddit_current_round}/${data.total_rounds} | T:${data.reddit_simulated_hours || 0}h | A:${data.reddit_actions_count}`)
-        prevRedditRound.value = data.reddit_current_round
-      }
-      
-      // Check if simulation is complete (via runner_status or platform completion)
-      const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped'
-      
-      // Additional check: if backend hasn't updated runner_status yet but platforms report complete
-      // Check via twitter_completed and reddit_completed status
-      const platformsCompleted = checkPlatformsCompleted(data)
-      
-      if (isCompleted || platformsCompleted) {
-        if (platformsCompleted && !isCompleted) {
-          addLog('All platform simulations detected as complete')
-        }
-        addLog('Simulation completed')
-        phase.value = 2
-        stopPolling()
-        emit('update-status', 'completed')
-      }
-    }
-  } catch (err) {
-    console.warn('Failed to get run status:', err)
+// Apply a terminal runner status (completed / stopped / failed) to the UI.
+const applyFinalStatus = (data) => {
+  const status = data.runner_status
+  if (status === 'failed') {
+    phase.value = 3
+    endReason.value = 'failed'
+    runError.value = data.error || null
+    addLog(`Simulation failed: ${data.error || 'Unknown error'}`)
+    emit('update-status', 'error')
+  } else if (status === 'stopped') {
+    phase.value = 2
+    endReason.value = 'stopped'
+    addLog('Simulation stopped before completing all rounds')
+    emit('update-status', 'completed')
+  } else {
+    phase.value = 2
+    endReason.value = 'completed'
+    addLog('Simulation completed')
+    emit('update-status', 'completed')
   }
 }
+
+const statusPoller = usePolling(async ({ isStale }) => {
+  if (!props.simulationId) return false
+  const res = await getRunStatus(props.simulationId)
+  if (isStale()) return
+  const data = res.data
+
+  runStatus.value = data
+
+  // Detect round changes for each platform and output logs
+  if (data.twitter_current_round > prevTwitterRound.value) {
+    addLog(`[Plaza] R${data.twitter_current_round}/${data.total_rounds} | T:${data.twitter_simulated_hours || 0}h | A:${data.twitter_actions_count}`)
+    prevTwitterRound.value = data.twitter_current_round
+  }
+
+  if (data.reddit_current_round > prevRedditRound.value) {
+    addLog(`[Community] R${data.reddit_current_round}/${data.total_rounds} | T:${data.reddit_simulated_hours || 0}h | A:${data.reddit_actions_count}`)
+    prevRedditRound.value = data.reddit_current_round
+  }
+
+  const isTerminal = ['completed', 'stopped', 'failed'].includes(data.runner_status)
+
+  // Fallback: backend hasn't updated runner_status yet but platforms report complete
+  const platformsCompleted = !isTerminal && checkPlatformsCompleted(data)
+
+  if (isTerminal || platformsCompleted) {
+    stopPolling()
+    if (platformsCompleted) {
+      addLog('All platform simulations detected as complete')
+      applyFinalStatus({ ...data, runner_status: 'completed' })
+    } else {
+      applyFinalStatus(data)
+    }
+    // Pick up the last actions written before the run ended
+    await fetchRunStatusDetail()
+  }
+}, { interval: 2000 })
 
 // Check if all enabled platforms have completed
 const checkPlatformsCompleted = (data) => {
   // If no platform data, return false
   if (!data) return false
-  
+
   // Check completion status of each platform
   const twitterCompleted = data.twitter_completed === true
   const redditCompleted = data.reddit_completed === true
-  
+
   // If at least one platform is done, check if all enabled platforms are done
   // Determine if platform was enabled via actions_count > 0 or running was true
   const twitterEnabled = (data.twitter_actions_count > 0) || data.twitter_running || twitterCompleted
   const redditEnabled = (data.reddit_actions_count > 0) || data.reddit_running || redditCompleted
-  
+
   // If no platform was enabled, return false
   if (!twitterEnabled && !redditEnabled) return false
-  
+
   // Check if all enabled platforms are complete
   if (twitterEnabled && !twitterCompleted) return false
   if (redditEnabled && !redditCompleted) return false
-  
+
   return true
 }
 
-const fetchRunStatusDetail = async () => {
+// Merge the server's action list into the timeline (deduplicated)
+const fetchRunStatusDetail = async ({ isStale = isDisposed } = {}) => {
   if (!props.simulationId) return
-  
   try {
     const res = await getRunStatusDetail(props.simulationId)
-    
-    if (res.success && res.data) {
-      // Use all_actions to get the full action list
-      const serverActions = res.data.all_actions || []
-      
-      // Incrementally add new actions (deduplicated)
-      let newActionsAdded = 0
-      serverActions.forEach(action => {
-        // Generate unique ID
-        const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
-        
-        if (!actionIds.value.has(actionId)) {
-          actionIds.value.add(actionId)
-          allActions.value.push({
-            ...action,
-            _uniqueId: actionId
-          })
-          newActionsAdded++
-        }
-      })
-      
-      // Don't auto-scroll, let users freely view the timeline
-      // New actions are appended at the bottom
-    }
+    if (isStale()) return
+    // Use all_actions to get the full action list
+    const serverActions = res.data.all_actions || []
+    serverActions.forEach(action => {
+      const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
+      if (!actionIds.value.has(actionId)) {
+        actionIds.value.add(actionId)
+        allActions.value.push({
+          ...action,
+          _uniqueId: actionId
+        })
+      }
+    })
+    // Don't auto-scroll, let users freely view the timeline
   } catch (err) {
     console.warn('Failed to get detailed status:', err)
   }
+}
+
+const detailPoller = usePolling((ctx) => fetchRunStatusDetail(ctx), { interval: 3000 })
+
+const stopPolling = () => {
+  statusPoller.stop()
+  detailPoller.stop()
 }
 
 // Helpers
@@ -651,23 +736,18 @@ const handleNextStep = async () => {
 
   isGeneratingReport.value = true
   addLog('Starting report generation...')
-  
+
   try {
     const res = await generateReport({
       simulation_id: props.simulationId,
       force_regenerate: true
     })
-    
-    if (res.success && res.data) {
-      const reportId = res.data.report_id
-      addLog(`Report generation task started: ${reportId}`)
+    if (isDisposed()) return
+    const reportId = res.data.report_id
+    addLog(`Report generation task started: ${reportId}`)
 
-      // Navigate to report page
-      router.push({ name: 'Report', params: { reportId } })
-    } else {
-      addLog(`Failed to start report generation: ${res.error || 'Unknown error'}`)
-      isGeneratingReport.value = false
-    }
+    // Navigate to report page
+    router.push({ name: 'Report', params: { reportId } })
   } catch (err) {
     addLog(`Report generation error: ${err.message}`)
     isGeneratingReport.value = false
@@ -686,13 +766,7 @@ watch(() => props.systemLogs?.length, () => {
 
 onMounted(() => {
   addLog('Step3 Simulation run initialized')
-  if (props.simulationId) {
-    doStartSimulation()
-  }
-})
-
-onUnmounted(() => {
-  stopPolling()
+  initRun()
 })
 </script>
 
@@ -896,6 +970,59 @@ onUnmounted(() => {
 .action-btn:disabled {
   opacity: 0.3;
   cursor: not-allowed;
+}
+
+.action-btn.ghost {
+  background: transparent;
+  color: #333;
+  border: 1px solid #CCC;
+}
+
+.action-btn.ghost:hover:not(:disabled) {
+  border-color: #000;
+  color: #000;
+}
+
+.action-btn.danger {
+  background: #C62828;
+  color: #FFF;
+}
+
+.action-btn.danger:hover:not(:disabled) {
+  background: #A31F1F;
+}
+
+.action-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.restart-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.restart-confirm-text {
+  font-size: 12px;
+  color: #555;
+}
+
+.run-banner {
+  padding: 10px 20px;
+  font-size: 13px;
+  border-bottom: 1px solid #EAEAEA;
+}
+
+.run-banner.error {
+  background: #FDECEA;
+  color: #A31F1F;
+}
+
+.run-banner.warn {
+  background: #FFF8E1;
+  color: #8A6D00;
 }
 
 /* --- Main Content Area --- */

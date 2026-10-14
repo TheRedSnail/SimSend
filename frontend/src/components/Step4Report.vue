@@ -1,5 +1,8 @@
 <template>
   <div class="report-panel">
+    <div v-if="reportFailed" class="report-failed-banner" role="status">
+      Report generation failed: {{ reportFailed }}
+    </div>
     <!-- Main Split Layout -->
     <div class="main-split-layout">
       <!-- LEFT PANEL: Report Style -->
@@ -390,7 +393,9 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
+import { ref, computed, watch, onMounted, nextTick, h, reactive } from 'vue'
+import { usePolling, useDisposed } from '../composables/usePolling'
+import { renderMarkdown } from '../utils/markdown'
 import { useRouter } from 'vue-router'
 import { getAgentLog, getConsoleLog, getReport } from '../api/report'
 
@@ -450,17 +455,6 @@ const toggleRawResult = (timestamp, event) => {
       rightPanel.value.scrollTop += scrollDelta
     })
   }
-}
-
-const toggleSectionContent = (idx) => {
-  if (!generatedSections.value[idx + 1]) return
-  const newSet = new Set(expandedContent.value)
-  if (newSet.has(idx)) {
-    newSet.delete(idx)
-  } else {
-    newSet.add(idx)
-  }
-  expandedContent.value = newSet
 }
 
 const toggleSectionCollapse = (idx) => {
@@ -1283,7 +1277,7 @@ const InterviewDisplay = {
     const cleanQuoteText = (text) => {
       if (!text) return ''
       // Remove leading patterns like "1. ", "2. ", "1、", "（1）", "(1)" etc.
-      return text.replace(/^\s*\d+[\.\、\)）]\s*/, '').trim()
+      return text.replace(/^\s*\d+[.、)）]\s*/, '').trim()
     }
     
     const activeIndex = ref(0)
@@ -1721,11 +1715,6 @@ const completedSections = computed(() => {
   return Object.keys(generatedSections.value).length
 })
 
-const progressPercent = computed(() => {
-  if (totalSections.value === 0) return 0
-  return Math.round((completedSections.value / totalSections.value) * 100)
-})
-
 const totalToolCalls = computed(() => {
   return agentLogs.value.filter(l => l.action === 'tool_call').length
 })
@@ -1866,120 +1855,6 @@ const truncateText = (text, maxLen) => {
   return text.substring(0, maxLen) + '...'
 }
 
-const renderMarkdown = (content) => {
-  if (!content) return ''
-
-  // SECURITY: this output is injected via v-html, and `content` is
-  // LLM-/agent-generated report text (attacker-influenceable through an
-  // uploaded document via prompt injection). Escape `&` and `<` up front so no
-  // raw tag in the content — e.g. an <img> with an onerror handler — can form.
-  // Markdown markers (#, *, backtick, -, >, _) are unaffected, and every HTML
-  // tag below is emitted by this function itself. `>` is deliberately left
-  // intact so blockquote markers still match.
-  content = String(content).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-
-  // Remove leading h2 title (## xxx), as section titles are already displayed in outer layer
-  let processedContent = content.replace(/^##\s+.+\n+/, '')
-
-  // Process code blocks
-  let html = processedContent.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
-
-  // Process inline code
-  html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-
-  // Process headings
-  html = html.replace(/^#### (.+)$/gm, '<h5 class="md-h5">$1</h5>')
-  html = html.replace(/^### (.+)$/gm, '<h4 class="md-h4">$1</h4>')
-  html = html.replace(/^## (.+)$/gm, '<h3 class="md-h3">$1</h3>')
-  html = html.replace(/^# (.+)$/gm, '<h2 class="md-h2">$1</h2>')
-
-  // Process blockquotes
-  html = html.replace(/^> (.+)$/gm, '<blockquote class="md-quote">$1</blockquote>')
-
-  // Process lists - supports sub-lists
-  html = html.replace(/^(\s*)- (.+)$/gm, (match, indent, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-li" data-level="${level}">${text}</li>`
-  })
-  html = html.replace(/^(\s*)(\d+)\. (.+)$/gm, (match, indent, num, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-oli" data-level="${level}">${text}</li>`
-  })
-
-  // Wrap unordered lists
-  html = html.replace(/(<li class="md-li"[^>]*>.*?<\/li>\s*)+/g, '<ul class="md-ul">$&</ul>')
-  // Wrap ordered lists
-  html = html.replace(/(<li class="md-oli"[^>]*>.*?<\/li>\s*)+/g, '<ol class="md-ol">$&</ol>')
-
-  // Clean all whitespace between list items
-  html = html.replace(/<\/li>\s+<li/g, '</li><li')
-  // Clean whitespace after list opening tags
-  html = html.replace(/<ul class="md-ul">\s+/g, '<ul class="md-ul">')
-  html = html.replace(/<ol class="md-ol">\s+/g, '<ol class="md-ol">')
-  // Clean whitespace before list closing tags
-  html = html.replace(/\s+<\/ul>/g, '</ul>')
-  html = html.replace(/\s+<\/ol>/g, '</ol>')
-  
-  // Process bold and italic
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>')
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>')
-  
-  // Process horizontal rules
-  html = html.replace(/^---$/gm, '<hr class="md-hr">')
-  
-  // Process line breaks - empty lines become paragraph breaks, single newlines become <br>
-  html = html.replace(/\n\n/g, '</p><p class="md-p">')
-  html = html.replace(/\n/g, '<br>')
-  
-  // Wrap in paragraphs
-  html = '<p class="md-p">' + html + '</p>'
-  
-  // Clean empty paragraphs
-  html = html.replace(/<p class="md-p"><\/p>/g, '')
-  html = html.replace(/<p class="md-p">(<h[2-5])/g, '$1')
-  html = html.replace(/(<\/h[2-5]>)<\/p>/g, '$1')
-  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>)<\/p>/g, '$1')
-  // Clean <br> tags around block-level elements
-  html = html.replace(/<br>\s*(<ul|<ol|<blockquote)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>)\s*<br>/g, '$1')
-  // Clean <p><br> immediately followed by block elements (caused by extra blank lines)
-  html = html.replace(/<p class="md-p">(<br>\s*)+(<ul|<ol|<blockquote|<pre|<hr)/g, '$2')
-  // Clean consecutive <br> tags
-  html = html.replace(/(<br>\s*){2,}/g, '<br>')
-  // Clean <br> between block-level closing tags and paragraph opening tags
-  html = html.replace(/(<\/ol>|<\/ul>|<\/blockquote>)<br>(<p|<div)/g, '$1$2')
-
-  // Fix numbering for non-contiguous ordered lists: maintain incrementing numbers when single-item <ol> blocks are separated by paragraph content
-  const tokens = html.split(/(<ol class="md-ol">(?:<li class="md-oli"[^>]*>[\s\S]*?<\/li>)+<\/ol>)/g)
-  let olCounter = 0
-  let inSequence = false
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].startsWith('<ol class="md-ol">')) {
-      const liCount = (tokens[i].match(/<li class="md-oli"/g) || []).length
-      if (liCount === 1) {
-        olCounter++
-        if (olCounter > 1) {
-          tokens[i] = tokens[i].replace('<ol class="md-ol">', `<ol class="md-ol" start="${olCounter}">`)
-        }
-        inSequence = true
-      } else {
-        olCounter = 0
-        inSequence = false
-      }
-    } else if (inSequence) {
-      if (/<h[2-5]/.test(tokens[i])) {
-        olCounter = 0
-        inSequence = false
-      }
-    }
-  }
-  html = tokens.join('')
-
-  return html
-}
-
 const getTimelineItemClass = (log, idx, total) => {
   const isLatest = idx === total - 1 && !isComplete.value
   const isMilestone = log.action === 'section_complete' || log.action === 'report_complete'
@@ -2021,18 +1896,21 @@ const getLogLevelClass = (log) => {
   return ''
 }
 
-// Polling
-let agentLogTimer = null
-let consoleLogTimer = null
+// Polling. Each poller is a setTimeout chain, so a slow response can't
+// overlap the next request and re-read the same from_line.
+const isDisposed = useDisposed()
 
-const fetchAgentLog = async () => {
+const fetchAgentLog = async ({ isStale }) => {
   if (!props.reportId) return
-  
+
   try {
     const res = await getAgentLog(props.reportId, agentLogLine.value)
-    
+    // Discard responses for a report we've since switched away from
+    if (isStale()) return
+
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
+      let sawError = false
       
       if (newLogs.length > 0) {
         newLogs.forEach(log => {
@@ -2067,10 +1945,20 @@ const fetchAgentLog = async () => {
           if (log.action === 'report_start') {
             startTime.value = new Date(log.timestamp)
           }
+
+          if (log.action === 'error') {
+            sawError = true
+          }
         })
         
         agentLogLine.value = res.data.from_line + newLogs.length
-        
+
+        // An error entry may mean the whole report failed; confirm with the
+        // report status so we stop polling instead of waiting forever.
+        if (sawError && !isComplete.value) {
+          await checkReportFailed(isStale)
+        }
+
         nextTick(() => {
           if (rightPanel.value) {
             // If task is complete, scroll to top; otherwise scroll to bottom to follow latest logs
@@ -2088,57 +1976,31 @@ const fetchAgentLog = async () => {
   }
 }
 
-// Extract final answer content - extract section content from LLM response
-const extractFinalContent = (response) => {
-  if (!response) return null
-  
-  // Try to extract content within <final_answer> tags
-  const finalAnswerTagMatch = response.match(/<final_answer>([\s\S]*?)<\/final_answer>/)
-  if (finalAnswerTagMatch) {
-    return finalAnswerTagMatch[1].trim()
-  }
-  
-  // Try to find content after Final Answer: (supports multiple formats)
-  // Format 1: Final Answer:\n\ncontent
-  // Format 2: Final Answer: content
-  const finalAnswerMatch = response.match(/Final\s*Answer:\s*\n*([\s\S]*)$/i)
-  if (finalAnswerMatch) {
-    return finalAnswerMatch[1].trim()
-  }
-  
-  // Try to find content after Chinese final answer marker (backward compatibility)
-  const chineseFinalMatch = response.match(/最终答案[:：]\s*\n*([\s\S]*)$/i)
-  if (chineseFinalMatch) {
-    return chineseFinalMatch[1].trim()
-  }
-  
-  // If starts with ## or # or >, it might be direct markdown content
-  const trimmedResponse = response.trim()
-  if (trimmedResponse.match(/^[#>]/)) {
-    return trimmedResponse
-  }
-  
-  // If content is long and contains markdown formatting, try removing thinking process and return
-  if (response.length > 300 && (response.includes('**') || response.includes('>'))) {
-    // Remove Thought: prefixed thinking process
-    const thoughtMatch = response.match(/^Thought:[\s\S]*?(?=\n\n[^T]|\n\n$)/i)
-    if (thoughtMatch) {
-      const afterThought = response.substring(thoughtMatch[0].length).trim()
-      if (afterThought.length > 100) {
-        return afterThought
-      }
+const reportFailed = ref(null)
+
+const checkReportFailed = async (isStale) => {
+  try {
+    const res = await getReport(props.reportId)
+    if (isStale()) return
+    if (res.data?.status === 'failed') {
+      reportFailed.value = res.data.error || 'Report generation failed'
+      addLog(`Report generation failed: ${reportFailed.value}`)
+      emit('update-status', 'error')
+      stopPolling()
     }
+  } catch (err) {
+    console.warn('Failed to check report status:', err)
   }
-  
-  return null
 }
 
-const fetchConsoleLog = async () => {
+// Extract final answer content - extract section content from LLM response
+const fetchConsoleLog = async ({ isStale }) => {
   if (!props.reportId) return
-  
+
   try {
     const res = await getConsoleLog(props.reportId, consoleLogLine.value)
-    
+    if (isStale()) return
+
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
       
@@ -2161,9 +2023,12 @@ const fetchConsoleLog = async () => {
 // Check if report is already complete and load it directly
 const loadCompletedReport = async () => {
   if (!props.reportId) return false
+  const requestedId = props.reportId
 
   try {
-    const res = await getReport(props.reportId)
+    const res = await getReport(requestedId)
+    // Ignore the answer if the user left or switched reports meanwhile
+    if (isDisposed() || requestedId !== props.reportId) return true
     if (res.success && res.data && res.data.status === 'completed') {
       const report = res.data
 
@@ -2224,25 +2089,19 @@ const loadCompletedReport = async () => {
   return false
 }
 
+const agentLogPoller = usePolling(fetchAgentLog, { interval: 2000 })
+const consoleLogPoller = usePolling(fetchConsoleLog, { interval: 1500 })
+
 const startPolling = () => {
-  if (agentLogTimer || consoleLogTimer) return
-
-  fetchAgentLog()
-  fetchConsoleLog()
-
-  agentLogTimer = setInterval(fetchAgentLog, 2000)
-  consoleLogTimer = setInterval(fetchConsoleLog, 1500)
+  if (agentLogPoller.isActive.value || consoleLogPoller.isActive.value) return
+  agentLogPoller.start()
+  consoleLogPoller.start()
 }
 
+// Stopping bumps the pollers' generation, so in-flight responses are dropped.
 const stopPolling = () => {
-  if (agentLogTimer) {
-    clearInterval(agentLogTimer)
-    agentLogTimer = null
-  }
-  if (consoleLogTimer) {
-    clearInterval(consoleLogTimer)
-    consoleLogTimer = null
-  }
+  agentLogPoller.stop()
+  consoleLogPoller.stop()
 }
 
 // Lifecycle
@@ -2250,18 +2109,18 @@ onMounted(async () => {
   if (props.reportId) {
     addLog(`Report Agent initialized: ${props.reportId}`)
     const alreadyDone = await loadCompletedReport()
-    if (!alreadyDone) {
+    if (!alreadyDone && !isDisposed()) {
       startPolling()
     }
   }
 })
 
-onUnmounted(() => {
-  stopPolling()
-})
-
 watch(() => props.reportId, async (newId) => {
+  // Stop the old report's polling first so late responses can't write the
+  // old log offsets into the new report's state.
+  stopPolling()
   if (newId) {
+    reportFailed.value = null
     agentLogs.value = []
     consoleLogs.value = []
     agentLogLine.value = 0
@@ -2276,7 +2135,7 @@ watch(() => props.reportId, async (newId) => {
     startTime.value = null
 
     const alreadyDone = await loadCompletedReport()
-    if (!alreadyDone) {
+    if (!alreadyDone && !isDisposed() && newId === props.reportId) {
       startPolling()
     }
   }
@@ -2284,6 +2143,14 @@ watch(() => props.reportId, async (newId) => {
 </script>
 
 <style scoped>
+.report-failed-banner {
+  padding: 10px 20px;
+  font-size: 13px;
+  background: #FDECEA;
+  color: #A31F1F;
+  border-bottom: 1px solid #F5C6C2;
+}
+
 .report-panel {
   height: 100%;
   display: flex;
