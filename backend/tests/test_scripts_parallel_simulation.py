@@ -210,3 +210,102 @@ def test_status_file_written_atomically(tmp_path):
     with open(handler.status_file, encoding="utf-8") as f:
         assert json.load(f)["status"] == "alive"
     assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
+
+
+# ------------------------------------------------------------- agent context cap
+
+class _FakeCreator:
+    def __init__(self):
+        self._token_limit = 1_000_000
+
+
+class _FakeMemory:
+    def __init__(self):
+        self.creator = _FakeCreator()
+
+    def get_context_creator(self):
+        return self.creator
+
+
+class _FakeAgent:
+    def __init__(self):
+        self.memory = _FakeMemory()
+
+
+class _FakeGraph:
+    def __init__(self, agents):
+        self._agents = agents
+
+    def get_agents(self):
+        return list(enumerate(self._agents))
+
+
+def test_cap_agent_context_sets_every_agents_limit():
+    agents = [_FakeAgent(), _FakeAgent(), object()]  # the last has no memory
+    assert sim.cap_agent_context(_FakeGraph(agents), 12000) == 2
+    assert all(a.memory.creator._token_limit == 12000 for a in agents[:2])
+
+
+def test_cap_agent_context_disabled():
+    agent = _FakeAgent()
+    assert sim.cap_agent_context(_FakeGraph([agent]), None) == 0
+    assert agent.memory.creator._token_limit == 1_000_000
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+    ("", sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+    ("8000", 8000),
+    ("0", None),
+    ("lots", sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+])
+def test_swarm_context_token_limit_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("SWARM_CONTEXT_TOKEN_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("SWARM_CONTEXT_TOKEN_LIMIT", raw)
+    assert sim.swarm_context_token_limit() == expected
+
+
+def test_capped_camel_context_drops_oldest_turns_and_keeps_system_prompt():
+    """Guards the private attribute against camel changes: the real context
+    creator must truncate against the value cap_agent_context sets."""
+    camel_memories = pytest.importorskip("camel.memories")
+    from camel.messages import BaseMessage
+    from camel.types import OpenAIBackendRole
+    from camel.utils import BaseTokenCounter
+
+    class WordCounter(BaseTokenCounter):
+        def count_tokens_from_messages(self, messages):
+            return sum(len(str(m.get("content", "")).split()) for m in messages)
+
+        def encode(self, text):
+            return text.split()
+
+        def decode(self, token_ids):
+            return " ".join(token_ids)
+
+    creator = camel_memories.ScoreBasedContextCreator(WordCounter(), 1_000_000)
+    memory = camel_memories.ChatHistoryMemory(creator)
+    memory.write_records([camel_memories.MemoryRecord(
+        message=BaseMessage.make_assistant_message("system", "persona profile"),
+        role_at_backend=OpenAIBackendRole.SYSTEM)])
+    for i in range(20):
+        memory.write_records([camel_memories.MemoryRecord(
+            message=BaseMessage.make_user_message("User", f"round {i} " + "feed " * 50),
+            role_at_backend=OpenAIBackendRole.USER)])
+
+    uncapped, uncapped_tokens = memory.get_context()
+
+    agent = _FakeAgent()
+    agent.memory = memory
+    sim.cap_agent_context(_FakeGraph([agent]), 300)
+    capped, capped_tokens = memory.get_context()
+
+    assert len(capped) < len(uncapped)
+    assert capped_tokens <= 300 < uncapped_tokens
+    assert capped[0]["content"] == "persona profile"
+    # The newest turns survive. (Their order here is arbitrary: the records
+    # were written in the same instant, so their timestamps tie.)
+    kept = {int(m["content"].split()[1]) for m in capped[1:]}
+    assert kept == set(range(20 - len(kept), 20))

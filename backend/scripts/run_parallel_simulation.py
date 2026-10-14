@@ -106,8 +106,13 @@ class MaxTokensWarningFilter(logging.Filter):
     """Filter out camel-ai max_tokens warnings (we intentionally don't set max_tokens, letting the model decide)"""
     
     def filter(self, record):
+        message = record.getMessage()
         # Filter out log entries containing max_tokens warnings
-        if "max_tokens" in record.getMessage() and "Invalid or missing" in record.getMessage():
+        if "max_tokens" in message and "Invalid or missing" in message:
+            return False
+        # Expected on every call once an agent's history exceeds the context
+        # cap (see cap_agent_context); not worth a line per call.
+        if message.startswith("Context truncation performed"):
             return False
         return True
 
@@ -1161,6 +1166,45 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     return ModelFactory.create(**create_kwargs)
 
 
+# Each OASIS agent keeps its whole chat history (every round's feed snapshot
+# plus its own tool calls), and camel sends all of it on every call unless the
+# agent's context has a token limit. The default limit is the model's context
+# window (about 1M tokens for DeepSeek V4 Flash), so prompts, and cost, grew
+# every round: a full 168-round run cost ~10x more in its second half than in
+# its first. With a cap, camel drops the oldest turns first, keeps each tool
+# call together with its result, and always keeps the persona's system prompt.
+DEFAULT_SWARM_CONTEXT_TOKENS = 12000
+
+
+def swarm_context_token_limit() -> Optional[int]:
+    """Per-agent context cap from SWARM_CONTEXT_TOKEN_LIMIT (0 = no cap)."""
+    raw = os.environ.get("SWARM_CONTEXT_TOKEN_LIMIT", "").strip()
+    if not raw:
+        return DEFAULT_SWARM_CONTEXT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"Ignoring invalid SWARM_CONTEXT_TOKEN_LIMIT={raw!r}; using {DEFAULT_SWARM_CONTEXT_TOKENS}")
+        return DEFAULT_SWARM_CONTEXT_TOKENS
+    return value if value > 0 else None
+
+
+def cap_agent_context(agent_graph, token_limit: Optional[int]) -> int:
+    """Cap every agent's context at ``token_limit`` tokens; returns how many were capped."""
+    if not token_limit:
+        return 0
+    capped = 0
+    for _, agent in agent_graph.get_agents():
+        memory = getattr(agent, "memory", None)
+        creator = memory.get_context_creator() if hasattr(memory, "get_context_creator") else None
+        # ScoreBasedContextCreator exposes token_limit read-only; the value it
+        # truncates against is _token_limit.
+        if creator is not None and hasattr(creator, "_token_limit"):
+            creator._token_limit = token_limit
+            capped += 1
+    return capped
+
+
 def get_active_agents_for_round(
     env,
     config: Dict[str, Any],
@@ -1328,6 +1372,13 @@ async def run_platform_simulation(
                 profile_path=profile_path, model=model, available_actions=REDDIT_ACTIONS,
             )
             platform_type = oasis.DefaultPlatformType.REDDIT
+
+        context_limit = swarm_context_token_limit()
+        capped = cap_agent_context(result.agent_graph, context_limit)
+        if context_limit:
+            log_info(f"Agent context capped at {context_limit} tokens ({capped} agents)")
+        else:
+            log_info("Agent context cap disabled (SWARM_CONTEXT_TOKEN_LIMIT=0)")
 
         # Real entity names instead of generic Agent_X labels
         agent_names = get_agent_names_from_config(config)
