@@ -336,3 +336,22 @@ def test_superseded_build_stops_and_cleans_up(client, monkeypatch):
     assert task.status == TaskStatus.FAILED
     assert ProjectManager.get_project(project.project_id).graph_id is None
     assert _FakeBuilder.deleted == ['graph_orphan']
+
+
+def test_report_status_follows_task_during_regeneration(client, monkeypatch):
+    # An older completed report exists for the simulation...
+    from types import SimpleNamespace
+    from app.models.task import TaskManager, TaskStatus
+    from app.services.report_agent import ReportManager, ReportStatus
+
+    old = SimpleNamespace(report_id='report_old', status=ReportStatus.COMPLETED)
+    monkeypatch.setattr(ReportManager, 'get_report_by_simulation', classmethod(lambda cls, sid: old))
+    # ...while a force_regenerate task is still running.
+    task_id = TaskManager().create_task('report_generate', metadata={'simulation_id': 'sim_x'})
+    TaskManager().update_task(task_id, status=TaskStatus.PROCESSING, progress=20)
+
+    with_task = post(client, '/api/report/generate/status', {'simulation_id': 'sim_x', 'task_id': task_id})
+    assert with_task.get_json()['data']['status'] == 'processing'
+
+    without_task = post(client, '/api/report/generate/status', {'simulation_id': 'sim_x'})
+    assert without_task.get_json()['data']['status'] == 'completed'
