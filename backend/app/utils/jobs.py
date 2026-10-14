@@ -1,12 +1,13 @@
 """
 Shared bounded background-job executor.
 
-Long-running work (graph build, simulation prepare, report generation) used to
-spawn an unbounded raw daemon thread per request, so the
-number of concurrent background jobs — and the LLM/Zep spend and OASIS
-subprocesses they drive — was effectively attacker-controlled. Routing that work
-through one shared, size-capped ThreadPoolExecutor bounds total concurrency;
-excess jobs queue instead of piling up.
+Long-running work (ontology generation, graph build, simulation prepare,
+profile generation, report generation) runs on one shared, size-capped
+ThreadPoolExecutor, so the number of concurrent background jobs — and the
+LLM/Zep spend they drive — is bounded; excess jobs queue instead of piling up.
+
+OASIS simulation subprocesses are NOT started through this pool; they are
+capped separately by SimulationRunner (SIMSEND_MAX_CONCURRENT_SIMULATIONS).
 
 This is intentionally in-process (no external broker) to keep deployment simple.
 Cap via MIROFISH_MAX_JOBS.

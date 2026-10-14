@@ -1,14 +1,35 @@
 """
 Task Status Management
 Used for tracking long-running tasks (such as graph building)
+
+Tasks are kept in memory and mirrored to ``uploads/tasks/<task_id>.json`` so
+their status survives a backend restart. Background jobs run in-process, so a
+task that was still pending/processing when the process stopped can never
+finish; on startup such tasks are marked failed ("interrupted by restart")
+instead of polling forever.
 """
 
+import os
+import json
+import time
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
+
+from ..config import Config
+from ..utils.atomic_io import atomic_write_json
+from ..utils.logger import get_logger
+
+logger = get_logger('mirofish.tasks')
+
+# Progress-only updates are persisted at most this often per task; status,
+# result and error changes are always persisted immediately.
+_PERSIST_INTERVAL_SECONDS = 1.0
+
+INTERRUPTED_MESSAGE = "Interrupted by a server restart. Please start it again."
 
 
 class TaskStatus(str, Enum):
@@ -17,6 +38,9 @@ class TaskStatus(str, Enum):
     PROCESSING = "processing"    # In progress
     COMPLETED = "completed"      # Completed
     FAILED = "failed"            # Failed
+
+
+ACTIVE_STATUSES = (TaskStatus.PENDING, TaskStatus.PROCESSING)
 
 
 @dataclass
@@ -50,11 +74,27 @@ class Task:
             "metadata": self.metadata,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Task':
+        return cls(
+            task_id=data["task_id"],
+            task_type=data.get("task_type", ""),
+            status=TaskStatus(data.get("status", TaskStatus.FAILED.value)),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            updated_at=datetime.fromisoformat(data.get("updated_at") or data["created_at"]),
+            progress=data.get("progress", 0),
+            message=data.get("message", ""),
+            result=data.get("result"),
+            error=data.get("error"),
+            metadata=data.get("metadata") or {},
+            progress_detail=data.get("progress_detail") or {},
+        )
+
 
 class TaskManager:
     """
     Task Manager
-    Thread-safe task status management
+    Thread-safe task status management, persisted to disk
     """
 
     _instance = None
@@ -65,10 +105,55 @@ class TaskManager:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._tasks: Dict[str, Task] = {}
-                    cls._instance._task_lock = threading.Lock()
+                    instance = super().__new__(cls)
+                    instance._tasks: Dict[str, Task] = {}
+                    instance._task_lock = threading.Lock()
+                    instance._last_persist: Dict[str, float] = {}
+                    instance._tasks_dir = Config.TASKS_DIR
+                    instance._load_from_disk()
+                    cls._instance = instance
         return cls._instance
+
+    # ---------- persistence ----------
+
+    def _task_path(self, task_id: str) -> str:
+        return os.path.join(self._tasks_dir, f"{task_id}.json")
+
+    def _persist(self, task: Task) -> None:
+        """Write ``task`` to disk. Caller holds ``_task_lock``."""
+        try:
+            atomic_write_json(self._task_path(task.task_id), task.to_dict())
+            self._last_persist[task.task_id] = time.monotonic()
+        except Exception as e:
+            # Persistence is best-effort: losing it only affects restarts.
+            logger.warning(f"Failed to persist task {task.task_id}: {e}")
+
+    def _load_from_disk(self) -> None:
+        if not os.path.isdir(self._tasks_dir):
+            return
+        interrupted = 0
+        for name in os.listdir(self._tasks_dir):
+            if not name.endswith('.json'):
+                continue
+            path = os.path.join(self._tasks_dir, name)
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    task = Task.from_dict(json.load(f))
+            except Exception as e:
+                logger.warning(f"Skipping unreadable task file {name}: {e}")
+                continue
+            if task.status in ACTIVE_STATUSES:
+                task.status = TaskStatus.FAILED
+                task.message = "Task failed"
+                task.error = INTERRUPTED_MESSAGE
+                task.updated_at = datetime.now()
+                self._persist(task)
+                interrupted += 1
+            self._tasks[task.task_id] = task
+        if interrupted:
+            logger.info(f"Marked {interrupted} interrupted task(s) as failed after restart")
+
+    # ---------- public API ----------
 
     def create_task(self, task_type: str, metadata: Optional[Dict] = None) -> str:
         """
@@ -95,9 +180,10 @@ class TaskManager:
 
         with self._task_lock:
             self._tasks[task_id] = task
+            self._persist(task)
 
-        # Opportunistically prune old finished tasks so the in-memory store
-        # doesn't grow unbounded over the process lifetime.
+        # Opportunistically prune old finished tasks so the store doesn't grow
+        # unbounded over the process lifetime.
         self.cleanup_old_tasks()
 
         return task_id
@@ -106,6 +192,17 @@ class TaskManager:
         """Get a task"""
         with self._task_lock:
             return self._tasks.get(task_id)
+
+    def find_active_task(self, task_type: str, **metadata) -> Optional[Task]:
+        """Return a pending/processing task of ``task_type`` whose metadata
+        contains all of ``metadata``, or None."""
+        with self._task_lock:
+            for task in self._tasks.values():
+                if task.task_type != task_type or task.status not in ACTIVE_STATUSES:
+                    continue
+                if all(task.metadata.get(k) == v for k, v in metadata.items()):
+                    return task
+        return None
 
     def update_task(
         self,
@@ -131,20 +228,26 @@ class TaskManager:
         """
         with self._task_lock:
             task = self._tasks.get(task_id)
-            if task:
-                task.updated_at = datetime.now()
-                if status is not None:
-                    task.status = status
-                if progress is not None:
-                    task.progress = progress
-                if message is not None:
-                    task.message = message
-                if result is not None:
-                    task.result = result
-                if error is not None:
-                    task.error = error
-                if progress_detail is not None:
-                    task.progress_detail = progress_detail
+            if not task:
+                return
+            task.updated_at = datetime.now()
+            if status is not None:
+                task.status = status
+            if progress is not None:
+                task.progress = progress
+            if message is not None:
+                task.message = message
+            if result is not None:
+                task.result = result
+            if error is not None:
+                task.error = error
+            if progress_detail is not None:
+                task.progress_detail = progress_detail
+
+            significant = status is not None or result is not None or error is not None
+            last = self._last_persist.get(task_id, 0.0)
+            if significant or time.monotonic() - last >= _PERSIST_INTERVAL_SECONDS:
+                self._persist(task)
 
     def complete_task(self, task_id: str, result: Dict):
         """Mark task as completed"""
@@ -174,8 +277,7 @@ class TaskManager:
             return [t.to_dict() for t in sorted(tasks, key=lambda x: x.created_at, reverse=True)]
 
     def cleanup_old_tasks(self, max_age_hours: int = 24):
-        """Clean up old tasks"""
-        from datetime import timedelta
+        """Clean up old finished tasks (memory and disk)"""
         cutoff = datetime.now() - timedelta(hours=max_age_hours)
 
         with self._task_lock:
@@ -185,3 +287,8 @@ class TaskManager:
             ]
             for tid in old_ids:
                 del self._tasks[tid]
+                self._last_persist.pop(tid, None)
+                try:
+                    os.remove(self._task_path(tid))
+                except OSError:
+                    pass
