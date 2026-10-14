@@ -390,6 +390,9 @@ class InterviewResult:
             "## In-Depth Interview Report",
             f"**Interview Topic:** {self.interview_topic}",
             f"**Interviewees:** {self.interviewed_count} / {self.total_agents} simulated agents",
+            "**Note:** these are the agents' own opinions, expectations and recollections, "
+            "not observed simulation events. Events they mention may not have happened; "
+            "check them against posts and graph facts before reporting them as fact.",
             "\n### Interviewee Selection Reasoning",
             self.selection_reasoning or "(Auto-selected)",
             "\n---",
@@ -1388,7 +1391,9 @@ Return a JSON-formatted list of sub-queries."""
             "6. Provide substantive content, at least 2-3 sentences per question\n"
             # Without this, some models (e.g. DeepSeek) answer part of the
             # interviews in Chinese, and the report quotes them verbatim.
-            "7. Answer in English\n\n"
+            "7. Answer in English\n"
+            "8. Base your answers on what you have actually seen and done in the simulation so far; "
+            "if a question asks about something you have not experienced, say so instead of inventing events\n\n"
         )
         optimized_prompt = f"{INTERVIEW_PROMPT_PREFIX}{combined_prompt}"
         
@@ -1680,6 +1685,7 @@ Question requirements:
 4. Natural language, like a real interview
 5. Keep each question concise and under 50 words
 6. Ask directly, do not include background explanations or prefixes
+7. Ask about what the interviewee has seen and done so far, and their current opinions and intentions; do not presuppose events or a time span that may not have happened (e.g. "by the end of the week")
 
 Return in JSON format: {"questions": ["question 1", "question 2", ...]}"""
 
