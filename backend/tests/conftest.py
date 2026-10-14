@@ -45,6 +45,7 @@ def data_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, 'OASIS_SIMULATION_DATA_DIR', str(sims))
     monkeypatch.setattr(Config, 'REPORTS_DIR', str(reports))
     monkeypatch.setattr(Config, 'TASKS_DIR', str(tasks))
+    monkeypatch.setattr(Config, 'SIGNUPS_FILE', str(uploads / 'signups.json'))
     monkeypatch.setattr(ProjectManager, 'PROJECTS_DIR', str(projects))
     monkeypatch.setattr(SimulationManager, 'SIMULATION_DATA_DIR', str(sims))
     monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(sims))
