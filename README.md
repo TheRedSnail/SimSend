@@ -8,7 +8,7 @@
 
 [![GitHub Stars](https://img.shields.io/github/stars/TheRedSnail/SimSend?style=flat-square&color=DAA520)](https://github.com/TheRedSnail/SimSend/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/TheRedSnail/SimSend?style=flat-square)](https://github.com/TheRedSnail/SimSend/network)
-[![Docker](https://img.shields.io/badge/Docker-Build-2496ED?style=flat-square&logo=docker&logoColor=white)](https://hub.docker.com/)
+[![Docker](https://img.shields.io/badge/Docker-GHCR-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/TheRedSnail/SimSend/pkgs/container/mirofish)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 
 </div>
@@ -86,7 +86,7 @@ MiroFish/
 
 | Tool | Version | Check |
 |------|---------|-------|
-| **Node.js** | 18+ | `node -v` |
+| **Node.js** | 20.19+ or 22.12+ | `node -v` |
 | **Python** | 3.11 - 3.12 | `python --version` |
 | **uv** | Latest | `uv --version` |
 
@@ -141,17 +141,34 @@ npm run backend    # Backend only
 npm run frontend   # Frontend only
 ```
 
+Both dev servers listen on `localhost` only. To reach them from another machine, set `FLASK_HOST=0.0.0.0` / `FRONTEND_HOST=0.0.0.0` — and set `ADMIN_API_KEY`, since the API has no user accounts.
+
+### Production (no dev servers)
+
+```bash
+npm start    # builds the frontend, then serves UI + API with waitress on http://localhost:5001
+```
+
 ### Docker
 
 ```bash
 cp .env.example .env    # Configure API keys
-docker compose up -d    # Start (ports 3000 + 5001)
+docker compose up -d    # UI + API on http://localhost:5001
+```
+
+The image builds the frontend and serves it from the backend with waitress, runs as a non-root user (uid 1000), and persists `backend/uploads` and `backend/logs`. The port is published on `127.0.0.1` only; set `BIND_ADDRESS=0.0.0.0` to expose it (put it behind a reverse proxy and set `ADMIN_API_KEY`). On Linux, make sure the mounted `backend/uploads` and `backend/logs` directories are writable by uid 1000.
+
+### Tests
+
+```bash
+npm test     # backend pytest + frontend vitest
+npm run lint # frontend ESLint
 ```
 
 ## Usage
 
-1. **Open** `http://localhost:3000`
-2. **Upload** one or more market research documents (PDF, DOCX, TXT)
+1. **Open** `http://localhost:3000` (dev) or `http://localhost:5001` (`npm start` / Docker)
+2. **Upload** one or more market research documents (PDF, Markdown, TXT)
 3. **Describe** your campaign brief — e.g., *"Simulate consumer reactions to a new eco-friendly packaging launch for our premium skincare line targeting young urban professionals"*
 4. **Click** "Launch Simulation Engine" and follow the 5-step workflow
 5. **Review** the generated Campaign Effectiveness Prediction Report
