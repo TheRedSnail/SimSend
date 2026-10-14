@@ -1385,7 +1385,10 @@ Return a JSON-formatted list of sub-queries."""
             "3. Do not use Markdown headings (e.g., #, ##, ###)\n"
             "4. Answer each question in order, starting each answer with 'Question X:' (X is the question number)\n"
             "5. Separate answers to different questions with blank lines\n"
-            "6. Provide substantive content, at least 2-3 sentences per question\n\n"
+            "6. Provide substantive content, at least 2-3 sentences per question\n"
+            # Without this, some models (e.g. DeepSeek) answer part of the
+            # interviews in Chinese, and the report quotes them verbatim.
+            "7. Answer in English\n\n"
         )
         optimized_prompt = f"{INTERVIEW_PROMPT_PREFIX}{combined_prompt}"
         
