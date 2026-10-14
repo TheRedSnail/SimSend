@@ -158,6 +158,19 @@ docker compose up -d    # UI + API on http://localhost:5001
 
 The image builds the frontend and serves it from the backend with waitress, runs as a non-root user (uid 1000), and persists `backend/uploads` and `backend/logs`. The port is published on `127.0.0.1` only; set `BIND_ADDRESS=0.0.0.0` to expose it (put it behind a reverse proxy and set `ADMIN_API_KEY`). On Linux, make sure the mounted `backend/uploads` and `backend/logs` directories are writable by uid 1000.
 
+### Landing page and early-access sign-ups
+
+`/welcome` is a scroll-driven landing page that walks through a sample run (documents → knowledge graph → conversations → report → follow-up questions) and ends with an early-access form. The app itself stays at `/`.
+
+Sign-ups are saved to `backend/uploads/signups.json`, one record per email address. To read them, set `ADMIN_API_KEY` and call:
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_API_KEY" http://localhost:5001/api/signup/list              # JSON
+curl -H "X-Admin-Key: $ADMIN_API_KEY" "http://localhost:5001/api/signup/list?format=csv"  # CSV
+```
+
+The sample run on the landing page is illustrative content (`frontend/src/components/landing/story.js`); replace it with a recorded run before relying on it.
+
 ### Tests
 
 ```bash
