@@ -243,8 +243,10 @@ def get_generate_status():
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
 
-        # If simulation_id is provided, first check if a completed report exists
-        if simulation_id:
+        # Without a task_id, fall back to "does a completed report exist?". With
+        # one, report that task's status: during a force_regenerate the old
+        # completed report must not make the new task look finished.
+        if simulation_id and not task_id:
             existing_report = ReportManager.get_report_by_simulation(simulation_id)
             if existing_report and existing_report.status == ReportStatus.COMPLETED:
                 return jsonify({
