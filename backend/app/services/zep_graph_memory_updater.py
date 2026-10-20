@@ -573,8 +573,13 @@ class ZepGraphMemoryUpdater:
     # ---------------------------------------------------------------- digest mode
 
     def _window_of(self, activity: AgentActivity) -> int:
-        """Index of the DIGEST_WINDOW_HOURS slice of simulated time the activity falls in."""
-        return int(activity.round_num * self.minutes_per_round / 60 // self.DIGEST_WINDOW_HOURS)
+        """Index of the DIGEST_WINDOW_HOURS slice of simulated time the activity falls in.
+
+        Round r (from 1) covers simulated minutes (r-1)*minutes_per_round up to
+        r*minutes_per_round; round 0 holds the opening posts.
+        """
+        started_minutes = max(activity.round_num - 1, 0) * self.minutes_per_round
+        return int(started_minutes / 60 // self.DIGEST_WINDOW_HOURS)
 
     def _buffer_for_digest(self, activity: AgentActivity, platform: str):
         """Collect a platform's activities per window; send a window once the next one starts."""

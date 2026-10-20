@@ -214,10 +214,10 @@ def test_mode_defaults_to_digest_and_reads_env(monkeypatch):
 
 
 def test_digest_sends_one_summary_when_the_next_window_starts(digester):
-    for r in (0, 2, 5):
+    for r in (0, 2, 6):  # opening posts, then rounds covering hours 1-2 and 5-6
         digester._buffer_for_digest(_act(r), "twitter")
     assert digester.client.graph.calls == []  # window 0-6h still open
-    digester._buffer_for_digest(_act(6), "twitter")
+    digester._buffer_for_digest(_act(7), "twitter")
     assert digester.client.graph.calls == ["Day 1, hours 0-6 of the campaign, on Twitter: summary"]
     prompt, kwargs = digester._llm.calls[0]
     assert prompt.count("Ann posted:") == 3
@@ -227,10 +227,12 @@ def test_digest_sends_one_summary_when_the_next_window_starts(digester):
 
 def test_digest_windows_follow_simulated_time(digester):
     digester.minutes_per_round = 30  # 12 rounds per 6-hour window
-    assert digester._window_of(_act(11)) == 0
-    assert digester._window_of(_act(12)) == 1
+    assert digester._window_of(_act(12)) == 0
+    assert digester._window_of(_act(13)) == 1
     digester.minutes_per_round = 60
-    assert digester._window_of(_act(47)) == 7  # day 2, hours 42-48
+    assert digester._window_of(_act(0)) == 0  # opening posts
+    assert digester._window_of(_act(48)) == 7  # day 2, hours 42-48
+    assert digester._window_of(_act(168)) == 27  # last round of a week, not a day 8 window
 
 
 def test_digest_lines_drop_parent_text_and_searches():
