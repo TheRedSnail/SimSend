@@ -22,6 +22,12 @@ logger = get_logger('mirofish.zep_graph_memory_updater')
 
 
 @dataclass
+class _PlatformEnd:
+    """Queue marker: the platform's simulation loop has ended."""
+    platform: str
+
+
+@dataclass
 class AgentActivity:
     """Agent Activity Record"""
     platform: str           # twitter / reddit
@@ -413,9 +419,15 @@ class ZepGraphMemoryUpdater:
             self._skipped_count += 1
             return
 
+        self._enqueue(activity)
+        self._total_activities += 1
+        logger.debug(f"Added activity to Zep queue: {activity.agent_name} - {activity.action_type}")
+
+    def _enqueue(self, item):
+        """Queue an activity or end marker; when full, drop the oldest entry."""
         while True:
             try:
-                self._activity_queue.put_nowait(activity)
+                self._activity_queue.put_nowait(item)
                 break
             except Full:
                 try:
@@ -428,8 +440,13 @@ class ZepGraphMemoryUpdater:
                         f"Zep activity queue full ({self.MAX_QUEUE_SIZE}); dropped "
                         f"{self._dropped_count} oldest activities so far (graph={self.graph_id})"
                     )
-        self._total_activities += 1
-        logger.debug(f"Added activity to Zep queue: {activity.agent_name} - {activity.action_type}")
+
+    def end_platform(self, platform: str):
+        """The platform's simulation loop is over: send what it still has buffered.
+
+        Queued behind its last activities, so they are buffered first.
+        """
+        self._enqueue(_PlatformEnd(platform))
 
     def add_activity_from_dict(self, data: Dict[str, Any], platform: str):
         """
@@ -471,6 +488,9 @@ class ZepGraphMemoryUpdater:
                     continue
 
                 platform = activity.platform.lower()
+                if isinstance(activity, _PlatformEnd):
+                    self._send_platform_buffer(platform)
+                    continue
                 if self.mode == "digest":
                     self._buffer_for_digest(activity, platform)
                     continue
@@ -536,6 +556,19 @@ class ZepGraphMemoryUpdater:
         logger.info(f"Successfully batch sent {item_count} {display_name} activities to graph {self.graph_id}")
         logger.debug(f"Batch content preview: {text[:200]}...")
         return True
+
+    def _send_platform_buffer(self, platform: str):
+        """Send everything a platform has buffered (a partial batch or open window)."""
+        with self._buffer_lock:
+            buffer = self._platform_buffers.get(platform) or []
+            self._platform_buffers[platform] = []
+        if not buffer:
+            return
+        if self.mode == "digest":
+            self._send_digest(buffer, platform)
+        else:
+            for i in range(0, len(buffer), self.FLUSH_CHUNK_SIZE):
+                self._send_batch_activities(buffer[i:i + self.FLUSH_CHUNK_SIZE], platform)
 
     # ---------------------------------------------------------------- digest mode
 
@@ -608,7 +641,8 @@ class ZepGraphMemoryUpdater:
                 activity = self._activity_queue.get_nowait()
             except Empty:
                 break
-            pending.setdefault(activity.platform.lower(), []).append(activity)
+            if not isinstance(activity, _PlatformEnd):
+                pending.setdefault(activity.platform.lower(), []).append(activity)
 
         for platform, items in pending.items():
             if items:

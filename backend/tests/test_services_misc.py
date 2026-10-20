@@ -281,3 +281,36 @@ def test_zep_search_query_is_cut_to_zeps_limit():
     result = tools.search_graph("g", "q" * 900)
     assert len(seen["query"]) == ZepToolsService.ZEP_MAX_QUERY_CHARS
     assert result.query == "q" * 900
+
+
+
+def _wait_for(cond, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_platform_end_sends_the_open_window_without_stopping(digester):
+    digester.start()
+    try:
+        digester.add_activity(_act(165))
+        digester.add_activity(_act(166, platform="reddit"))
+        digester.end_platform("twitter")
+        assert _wait_for(lambda: digester.client.graph.calls)
+        assert digester.client.graph.calls == ["Day 7, hours 162-168 of the campaign, on Twitter: summary"]
+        assert digester.get_stats()["buffer_sizes"]["reddit"] == 1  # reddit is still running
+    finally:
+        digester.stop(flush_timeout=2)
+
+
+def test_platform_end_sends_a_partial_batch_in_full_mode(updater):
+    updater.start()
+    try:
+        for i in range(3):
+            updater.add_activity(_activity(i))
+        updater.end_platform("twitter")
+        assert _wait_for(lambda: updater.client.graph.calls)
+        assert len(updater.client.graph.calls[0].splitlines()) == 3
+    finally:
+        updater.stop(flush_timeout=2)
