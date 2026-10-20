@@ -436,6 +436,11 @@ class ZepToolsService:
     # Retry configuration
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
+    ZEP_MAX_QUERY_CHARS = 400  # Zep's limit for graph.search queries
+    # A batch of 5-6 agents on both platforms took 2.5-4 minutes in test runs.
+    # Timing out doesn't stop the batch: the next interview would queue behind
+    # it and time out too, so the report would lose all of them.
+    INTERVIEW_TIMEOUT = 600.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
@@ -493,13 +498,15 @@ class ZepToolsService:
             SearchResult: Search results
         """
         logger.info(f"Graph search: graph_id={graph_id}, query={query[:50]}...")
-        
-        # Try using Zep Cloud Search API
+
+        # Try using Zep Cloud Search API. Zep rejects queries longer than its
+        # limit outright (HTTP 400), and the report agent often writes long ones.
+        zep_query = query[:self.ZEP_MAX_QUERY_CHARS]
         try:
             search_results = self._call_with_retry(
                 func=lambda: self.client.graph.search(
                     graph_id=graph_id,
-                    query=query,
+                    query=zep_query,
                     limit=limit,
                     scope=scope,
                     reranker="cross_encoder"
@@ -1415,7 +1422,7 @@ Return a JSON-formatted list of sub-queries."""
                 simulation_id=simulation_id,
                 interviews=interviews_request,
                 platform=None,  # No platform specified, dual-platform interview
-                timeout=180.0   # Dual-platform needs longer timeout
+                timeout=self.INTERVIEW_TIMEOUT
             )
             
             logger.info(f"Interview API returned: {api_result.get('interviews_count', 0)} results, success={api_result.get('success')}")

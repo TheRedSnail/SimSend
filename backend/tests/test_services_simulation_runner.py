@@ -285,3 +285,22 @@ def test_read_action_log_applies_events(runner, tmp_path):
     assert st.twitter_current_round == 1
     assert st.twitter_actions_count == 1
     assert pos < log.stat().st_size
+
+
+
+def test_platform_end_tells_the_graph_updater(runner, tmp_path, monkeypatch):
+    cls, _ = runner
+    ended, added = [], []
+    fake = type("U", (), {"end_platform": lambda self, p: ended.append(p),
+                          "add_activity_from_dict": lambda self, d, p: added.append(p)})()
+    monkeypatch.setattr("app.services.simulation_runner.ZepGraphMemoryManager.get_updater", lambda sim_id: fake)
+    cls._graph_memory_enabled["sim_test"] = True
+    log = tmp_path / "actions.jsonl"
+    log.write_text(
+        json.dumps({"round": 167, "agent_id": 3, "agent_name": "A", "action_type": "CREATE_POST"}) + "\n"
+        + json.dumps({"event_type": "simulation_end", "total_rounds": 168}) + "\n",
+        encoding="utf-8",
+    )
+    cls._read_action_log(str(log), 0, _state(platform="twitter"), "twitter")
+    assert added == ["twitter"]
+    assert ended == ["twitter"]

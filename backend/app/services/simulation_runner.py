@@ -529,7 +529,7 @@ class SimulationRunner:
 
             if enable_graph_memory_update:
                 try:
-                    ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
+                    ZepGraphMemoryManager.create_updater(simulation_id, graph_id, minutes_per_round=minutes_per_round)
                     cls._graph_memory_enabled[simulation_id] = True
                     logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
                 except Exception as e:
@@ -835,6 +835,11 @@ class SimulationRunner:
                             
                     if "event_type" in action_data:
                         cls._apply_event(state, platform, action_data)
+                        # The environment stays up for interviews after the
+                        # loop ends, so the updater isn't stopped yet: send the
+                        # platform's last activity now, before the report.
+                        if graph_updater and action_data["event_type"] in ("simulation_end", "simulation_failed"):
+                            graph_updater.end_platform(platform)
                         continue
                                 
                     action = AgentAction(

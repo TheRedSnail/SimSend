@@ -1019,6 +1019,12 @@ REACT_INSUFFICIENT_TOOLS_MSG_ALT = (
     "Please call tools to retrieve simulation data.{unused_hint}"
 )
 
+REACT_MALFORMED_TOOL_CALL_MSG = (
+    "[Format Error] Your tool call could not be read. Either call a tool with exactly "
+    '<tool_call>{"name": "tool_name", "parameters": {...}}</tool_call>, '
+    'or write the section content starting with "Final Answer:".'
+)
+
 REACT_TOOL_LIMIT_MSG = (
     "Tool call limit reached ({tool_calls_count}/{max_tool_calls}), no more tool calls allowed. "
     'Please immediately output section content starting with "Final Answer:" based on the information gathered.'
@@ -1324,8 +1330,10 @@ class ReportAgent:
         """
         tool_calls = []
 
-        # Format 1: XML style (standard format)
-        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+        # Format 1: XML style (standard format). Models sometimes close it with
+        # another tag (</tool_action>, DeepSeek's </｜DSML｜tool_call>) or not at
+        # all; the JSON is what matters.
+        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*(?=</[^>]*>|<tool_call>|$)'
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
                 call_data = json.loads(match.group(1))
@@ -1361,7 +1369,30 @@ class ReportAgent:
             except json.JSONDecodeError:
                 pass
 
+        if not tool_calls:
+            tool_calls = self._parse_dsml_tool_calls(response)
         return tool_calls
+
+    _DSML_CALL = re.compile(r'<｜DSML｜tool_call>(.*?)(?:</｜DSML｜tool_call>|$)', re.DOTALL)
+    _DSML_NAME = re.compile(r'<｜DSML｜tool_name>\s*([\w-]+)')
+    _DSML_PARAM = re.compile(r'<｜DSML｜parameter name="([^"]+)">(.*?)</｜DSML｜parameter>', re.DOTALL)
+
+    def _parse_dsml_tool_calls(self, response: str) -> List[Dict[str, Any]]:
+        """DeepSeek sometimes falls back to its native tool-call markup:
+        <｜DSML｜tool_call><｜DSML｜tool_name>x</...><｜DSML｜parameter name="k">v</...>..."""
+        calls = []
+        for block in self._DSML_CALL.findall(response):
+            data: Dict[str, Any] = {}
+            name = self._DSML_NAME.search(block)
+            if name:
+                data["name"] = name.group(1)
+            for key, value in self._DSML_PARAM.findall(block):
+                value = value.strip()
+                data[key] = int(value) if value.isdigit() else value
+            normalized = self._normalize_tool_call(data)
+            if normalized:
+                calls.append(normalized)
+        return calls
 
     _TOOL_NAME_KEYS = ("name", "tool", "tool_name", "function")
     _TOOL_PARAM_KEYS = ("parameters", "params", "arguments", "args", "input")
@@ -1384,7 +1415,8 @@ class ReportAgent:
         if not name or name not in self.VALID_TOOL_NAMES:
             return None
 
-        params: Any = {}
+        # Parameters may also sit next to the name: {"name": ..., "query": ...}
+        params: Any = {k: v for k, v in data.items() if k not in self._TOOL_NAME_KEYS}
         for key in self._TOOL_PARAM_KEYS:
             if key in data and data[key] is not None:
                 params = data[key]
@@ -1397,6 +1429,14 @@ class ReportAgent:
         if not isinstance(params, dict):
             params = {}
         return {"name": name, "parameters": params}
+
+    # Models often bold the marker ("**Final Answer:**"); take the emphasis with it
+    _FINAL_ANSWER_MARKER = re.compile(r"\*{0,2}Final Answer:\*{0,2}")
+
+    @classmethod
+    def _after_final_answer(cls, response: str) -> str:
+        """Section text after the last "Final Answer:" marker."""
+        return cls._FINAL_ANSWER_MARKER.split(response)[-1].strip()
 
     def _is_valid_tool_call(self, data: dict) -> bool:
         """Backwards-compatible check; prefer _normalize_tool_call."""
@@ -1690,7 +1730,7 @@ class ReportAgent:
                     continue
 
                 # Normal completion
-                final_answer = response.split("Final Answer:")[-1].strip()
+                final_answer = self._after_final_answer(response)
                 logger.info(f"Section {section.title} generation complete (tool calls: {tool_calls_count})")
 
                 if self.report_logger:
@@ -1786,6 +1826,13 @@ class ReportAgent:
                 })
                 continue
 
+            # A tool call we couldn't parse is not section content: saving it
+            # would put the model's working notes into the report.
+            if re.search(r"<[^>]{0,12}tool_call", response):
+                logger.warning(f"Section {section.title} iteration {iteration + 1}: unparseable tool call, asking again")
+                messages.append({"role": "user", "content": REACT_MALFORMED_TOOL_CALL_MSG})
+                continue
+
             # Tool calls sufficient, LLM output content without "Final Answer:" prefix
             # Accept content directly as final answer, no more idle loops
             logger.info(f"Section {section.title} no 'Final Answer:' prefix detected, accepting LLM output as final content (tool calls: {tool_calls_count})")
@@ -1820,7 +1867,7 @@ class ReportAgent:
             # others) rather than saving an empty section as if it succeeded.
             raise RuntimeError("LLM returned an empty response")
         if "Final Answer:" in response:
-            final_answer = response.split("Final Answer:")[-1].strip()
+            final_answer = self._after_final_answer(response)
         else:
             final_answer = response.strip()
         

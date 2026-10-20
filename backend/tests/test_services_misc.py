@@ -1,4 +1,4 @@
-"""SimulationManager persistence, report-agent tool-call parsing, Zep updater backpressure."""
+"""SimulationManager persistence, report-agent tool-call parsing, Zep updater backpressure and digests."""
 
 import json
 import os
@@ -79,9 +79,33 @@ def agent():
      {"name": "quick_search", "parameters": {"query": "q"}}),
     ('Thinking...\n{"name": "quick_search", "args": {"query": "q"}}',
      {"name": "quick_search", "parameters": {"query": "q"}}),
+    # Seen from DeepSeek: wrong closing tag, parameters next to the name
+    ('Let me search.<tool_call>\n{"name": "quick_search", "query": "q", "limit": 15}\n</tool_action>\n',
+     {"name": "quick_search", "parameters": {"query": "q", "limit": 15}}),
+    ('<tool_call>{"name": "panorama_search", "parameters": {"query": "q"}}',
+     {"name": "panorama_search", "parameters": {"query": "q"}}),
+    # DeepSeek's native markup, alone or closing a JSON call
+    ('<tool_call>\n{"name": "quick_search", "parameters": {"query": "q"}}\n</｜DSML｜tool_call>',
+     {"name": "quick_search", "parameters": {"query": "q"}}),
+    ('<｜DSML｜tool_call>\n<｜DSML｜tool_name>interview_agents</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="interview_topic">How do you feel?</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="max_agents">6</｜DSML｜parameter>\n</｜DSML｜tool_call>',
+     {"name": "interview_agents", "parameters": {"interview_topic": "How do you feel?", "max_agents": 6}}),
+    ('<｜DSML｜tool_call>\n<｜DSML｜parameter name="limit">15</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="name">simulation_activity</｜DSML｜parameter>\n</｜DSML｜tool_call>',
+     {"name": "simulation_activity", "parameters": {"limit": 15}}),
 ])
 def test_tool_call_variants_are_normalized(agent, payload, expected):
     assert agent._parse_tool_calls(payload) == [expected]
+
+
+@pytest.mark.parametrize("response, expected", [
+    ("Done.\n\n**Final Answer:**\n\nThe week split by segment.", "The week split by segment."),
+    ("Final Answer: **Students** stayed.", "**Students** stayed."),
+    ("Final Answer:Plain", "Plain"),
+])
+def test_final_answer_marker_is_removed_with_its_bold(response, expected):
+    assert ReportAgent._after_final_answer(response) == expected
 
 
 def test_unknown_or_malformed_tool_calls_are_ignored(agent):
@@ -134,7 +158,7 @@ def _activity(i, platform="twitter"):
 def updater(monkeypatch):
     monkeypatch.setattr(ZepGraphMemoryUpdater, "MAX_QUEUE_SIZE", 10)
     monkeypatch.setattr(ZepGraphMemoryUpdater, "RETRY_DELAY", 0)
-    u = ZepGraphMemoryUpdater("graph_x", api_key="test")
+    u = ZepGraphMemoryUpdater("graph_x", api_key="test", mode="full")
     u.client = _FakeZep()
     return u
 
@@ -176,3 +200,143 @@ def test_stop_is_bounded_when_zep_is_down(updater, monkeypatch):
     updater.stop(flush_timeout=2)
     assert time.monotonic() - started < 6
     assert updater.get_stats()["items_sent"] == 0
+
+
+class _FakeLLM:
+    def __init__(self, reply="summary", fail=False):
+        self.reply, self.fail, self.calls = reply, fail, []
+
+    def chat(self, messages, **kwargs):
+        if self.fail:
+            raise ConnectionError("llm down")
+        self.calls.append((messages[-1]["content"], kwargs))
+        return self.reply
+
+
+def _act(round_num, action_type="CREATE_POST", platform="twitter", **args):
+    return AgentActivity(platform=platform, agent_id=1, agent_name="Ann", action_type=action_type,
+                         action_args=args or {"content": f"post in round {round_num}"},
+                         round_num=round_num, timestamp="t")
+
+
+@pytest.fixture
+def digester(monkeypatch):
+    monkeypatch.setattr(ZepGraphMemoryUpdater, "RETRY_DELAY", 0)
+    u = ZepGraphMemoryUpdater("graph_x", api_key="test", mode="digest", minutes_per_round=60)
+    u.client = _FakeZep()
+    u._llm = _FakeLLM()
+    return u
+
+
+def test_mode_defaults_to_digest_and_reads_env(monkeypatch):
+    monkeypatch.delenv("ZEP_ACTIVITY_MODE", raising=False)
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "digest"
+    monkeypatch.setenv("ZEP_ACTIVITY_MODE", "full")
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "full"
+    monkeypatch.setenv("ZEP_ACTIVITY_MODE", "bogus")
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "digest"
+
+
+def test_digest_sends_one_summary_when_the_next_window_starts(digester):
+    for r in (0, 2, 6):  # opening posts, then rounds covering hours 1-2 and 5-6
+        digester._buffer_for_digest(_act(r), "twitter")
+    assert digester.client.graph.calls == []  # window 0-6h still open
+    digester._buffer_for_digest(_act(7), "twitter")
+    assert digester.client.graph.calls == ["Day 1, hours 0-6 of the campaign, on Twitter: summary"]
+    prompt, kwargs = digester._llm.calls[0]
+    assert prompt.count("Ann posted:") == 3
+    assert kwargs["reasoning"] is False
+    assert digester.get_stats()["items_sent"] == 3
+
+
+def test_digest_windows_follow_simulated_time(digester):
+    digester.minutes_per_round = 30  # 12 rounds per 6-hour window
+    assert digester._window_of(_act(12)) == 0
+    assert digester._window_of(_act(13)) == 1
+    digester.minutes_per_round = 60
+    assert digester._window_of(_act(0)) == 0  # opening posts
+    assert digester._window_of(_act(48)) == 7  # day 2, hours 42-48
+    assert digester._window_of(_act(168)) == 27  # last round of a week, not a day 8 window
+
+
+def test_digest_lines_drop_parent_text_and_searches():
+    like = _act(1, "LIKE_POST", post_author_name="Bob", post_content="x" * 900)
+    assert like.to_digest_line() == "Ann liked a post by Bob"
+    reply = _act(1, "CREATE_COMMENT", content="y " * 400, post_author_name="Bob", post_content="z" * 900)
+    line = reply.to_digest_line()
+    assert line.startswith('Ann replied to Bob: "y y') and "z" not in line
+    assert len(line) < AgentActivity.DIGEST_OWN_TEXT_CHARS + 40
+    quote = _act(1, "QUOTE_POST", quote_content="mine", original_author_name="Bob", original_content="theirs")
+    assert quote.to_digest_line() == 'Ann quoted Bob: "mine"'
+    assert _act(1, "SEARCH_POSTS", query="velora").to_digest_line() is None
+
+
+def test_digest_falls_back_to_activity_lines_when_llm_fails(digester):
+    digester._llm = _FakeLLM(fail=True)
+    digester._send_digest([_act(0), _act(1)], "reddit")
+    (sent,) = digester.client.graph.calls
+    assert sent.startswith("Day 1, hours 0-6 of the campaign, on Reddit:\n")
+    assert sent.count("Ann posted:") == 2
+
+
+def test_digest_flush_summarises_each_open_window(digester):
+    for r in (0, 7):
+        digester.add_activity(_act(r))
+    digester.add_activity(_act(0, platform="reddit"))
+    digester._flush_remaining(time.monotonic() + 5)
+    assert sorted(c.split(":")[0] for c in digester.client.graph.calls) == [
+        "Day 1, hours 0-6 of the campaign, on Reddit",
+        "Day 1, hours 0-6 of the campaign, on Twitter",
+        "Day 1, hours 6-12 of the campaign, on Twitter",
+    ]
+    assert len(digester._llm.calls) == 3
+
+
+
+def test_zep_search_query_is_cut_to_zeps_limit():
+    from types import SimpleNamespace
+    from app.services.zep_tools import ZepToolsService
+    seen = {}
+
+    def search(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(edges=[], nodes=[])
+
+    tools = ZepToolsService.__new__(ZepToolsService)
+    tools.client = SimpleNamespace(graph=SimpleNamespace(search=search))
+    result = tools.search_graph("g", "q" * 900)
+    assert len(seen["query"]) == ZepToolsService.ZEP_MAX_QUERY_CHARS
+    assert result.query == "q" * 900
+
+
+
+def _wait_for(cond, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_platform_end_sends_the_open_window_without_stopping(digester):
+    digester.start()
+    try:
+        digester.add_activity(_act(165))
+        digester.add_activity(_act(166, platform="reddit"))
+        digester.end_platform("twitter")
+        assert _wait_for(lambda: digester.client.graph.calls)
+        assert digester.client.graph.calls == ["Day 7, hours 162-168 of the campaign, on Twitter: summary"]
+        assert digester.get_stats()["buffer_sizes"]["reddit"] == 1  # reddit is still running
+    finally:
+        digester.stop(flush_timeout=2)
+
+
+def test_platform_end_sends_a_partial_batch_in_full_mode(updater):
+    updater.start()
+    try:
+        for i in range(3):
+            updater.add_activity(_activity(i))
+        updater.end_platform("twitter")
+        assert _wait_for(lambda: updater.client.graph.calls)
+        assert len(updater.client.graph.calls[0].splitlines()) == 3
+    finally:
+        updater.stop(flush_timeout=2)
