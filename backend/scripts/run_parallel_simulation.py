@@ -66,6 +66,7 @@ if sys.platform == 'win32':
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import random
@@ -185,6 +186,8 @@ def init_logging_for_simulation(simulation_dir: str):
 from action_logger import SimulationLogManager, PlatformActionLogger
 
 try:
+    from camel.memories import MemoryRecord
+    from camel.messages import FunctionCallingMessage
     from camel.models import ModelFactory
     from camel.types import ModelPlatformType
     import oasis
@@ -1173,6 +1176,15 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
 # every round: a full 168-round run cost ~10x more in its second half than in
 # its first. With a cap, camel drops the oldest turns first, keeps each tool
 # call together with its result, and always keeps the persona's system prompt.
+#
+# The cap must only apply when the prompt is built, not when messages are
+# stored. camel's ChatAgent.update_memory slices any message bigger than the
+# budget left in the (already truncated) context, and once an agent is full
+# that budget is ~0, so every feed snapshot was stored as thousands of
+# one-token "[chunk n/N]" records. Agents then saw a garbled tail of their
+# feed: in a measured run they commented 75% less and searched instead.
+# Capped agents therefore store each message whole, shortened only if it alone
+# would take more than half the cap.
 DEFAULT_SWARM_CONTEXT_TOKENS = 12000
 
 
@@ -1201,8 +1213,35 @@ def cap_agent_context(agent_graph, token_limit: Optional[int]) -> int:
         # truncates against is _token_limit.
         if creator is not None and hasattr(creator, "_token_limit"):
             creator._token_limit = token_limit
+            agent.update_memory = _whole_message_memory_writer(
+                agent, creator.token_counter, token_limit // 2)
             capped += 1
     return capped
+
+
+def _whole_message_memory_writer(agent, token_counter, max_message_tokens: int):
+    """Stand-in for camel's ChatAgent.update_memory that never slices a message."""
+    def update_memory(message, role, timestamp: Optional[float] = None) -> None:
+        agent.memory.write_record(MemoryRecord(
+            message=shorten_message(message, token_counter, max_message_tokens),
+            role_at_backend=role,
+            timestamp=timestamp if timestamp is not None else time.time_ns() / 1_000_000_000,
+            agent_id=agent.agent_id,
+        ))
+    return update_memory
+
+
+def shorten_message(message, token_counter, max_tokens: int):
+    """Keep the first ``max_tokens`` tokens of a message's text (a tool result's, if it has one)."""
+    field = "result" if isinstance(message, FunctionCallingMessage) and isinstance(message.result, str) else "content"
+    text = getattr(message, field)
+    if not isinstance(text, str):
+        return message
+    token_ids = token_counter.encode(text)
+    if len(token_ids) <= max_tokens:
+        return message
+    short = token_counter.decode(token_ids[:max_tokens]) + "\n[... cut to fit the agent's context limit]"
+    return dataclasses.replace(message, **{field: short})
 
 
 def get_active_agents_for_round(

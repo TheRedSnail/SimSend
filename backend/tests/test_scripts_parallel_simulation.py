@@ -214,9 +214,29 @@ def test_status_file_written_atomically(tmp_path):
 
 # ------------------------------------------------------------- agent context cap
 
+from camel.memories import ChatHistoryMemory, MemoryRecord, ScoreBasedContextCreator  # noqa: E402
+from camel.messages import BaseMessage, FunctionCallingMessage  # noqa: E402
+from camel.types import OpenAIBackendRole  # noqa: E402
+from camel.utils import BaseTokenCounter  # noqa: E402
+
+
+class _WordCounter(BaseTokenCounter):
+    """One token per word, so budgets in these tests are easy to reason about."""
+
+    def count_tokens_from_messages(self, messages):
+        return sum(len(str(m.get("content", "")).split()) for m in messages)
+
+    def encode(self, text):
+        return text.split()
+
+    def decode(self, token_ids):
+        return " ".join(token_ids)
+
+
 class _FakeCreator:
     def __init__(self):
         self._token_limit = 1_000_000
+        self.token_counter = _WordCounter()
 
 
 class _FakeMemory:
@@ -228,8 +248,10 @@ class _FakeMemory:
 
 
 class _FakeAgent:
-    def __init__(self):
-        self.memory = _FakeMemory()
+    agent_id = "agent-0"
+
+    def __init__(self, memory=None):
+        self.memory = memory or _FakeMemory()
 
 
 class _FakeGraph:
@@ -238,6 +260,14 @@ class _FakeGraph:
 
     def get_agents(self):
         return list(enumerate(self._agents))
+
+
+def _camel_memory_with_persona():
+    memory = ChatHistoryMemory(ScoreBasedContextCreator(_WordCounter(), 1_000_000))
+    memory.write_records([MemoryRecord(
+        message=BaseMessage.make_assistant_message("system", "persona profile"),
+        role_at_backend=OpenAIBackendRole.SYSTEM)])
+    return memory
 
 
 def test_cap_agent_context_sets_every_agents_limit():
@@ -250,6 +280,7 @@ def test_cap_agent_context_disabled():
     agent = _FakeAgent()
     assert sim.cap_agent_context(_FakeGraph([agent]), None) == 0
     assert agent.memory.creator._token_limit == 1_000_000
+    assert "update_memory" not in vars(agent)
 
 
 @pytest.mark.parametrize("raw, expected", [
@@ -270,36 +301,15 @@ def test_swarm_context_token_limit_env(monkeypatch, raw, expected):
 def test_capped_camel_context_drops_oldest_turns_and_keeps_system_prompt():
     """Guards the private attribute against camel changes: the real context
     creator must truncate against the value cap_agent_context sets."""
-    camel_memories = pytest.importorskip("camel.memories")
-    from camel.messages import BaseMessage
-    from camel.types import OpenAIBackendRole
-    from camel.utils import BaseTokenCounter
-
-    class WordCounter(BaseTokenCounter):
-        def count_tokens_from_messages(self, messages):
-            return sum(len(str(m.get("content", "")).split()) for m in messages)
-
-        def encode(self, text):
-            return text.split()
-
-        def decode(self, token_ids):
-            return " ".join(token_ids)
-
-    creator = camel_memories.ScoreBasedContextCreator(WordCounter(), 1_000_000)
-    memory = camel_memories.ChatHistoryMemory(creator)
-    memory.write_records([camel_memories.MemoryRecord(
-        message=BaseMessage.make_assistant_message("system", "persona profile"),
-        role_at_backend=OpenAIBackendRole.SYSTEM)])
+    memory = _camel_memory_with_persona()
     for i in range(20):
-        memory.write_records([camel_memories.MemoryRecord(
+        memory.write_records([MemoryRecord(
             message=BaseMessage.make_user_message("User", f"round {i} " + "feed " * 50),
             role_at_backend=OpenAIBackendRole.USER)])
 
     uncapped, uncapped_tokens = memory.get_context()
 
-    agent = _FakeAgent()
-    agent.memory = memory
-    sim.cap_agent_context(_FakeGraph([agent]), 300)
+    sim.cap_agent_context(_FakeGraph([_FakeAgent(memory)]), 300)
     capped, capped_tokens = memory.get_context()
 
     assert len(capped) < len(uncapped)
@@ -309,3 +319,57 @@ def test_capped_camel_context_drops_oldest_turns_and_keeps_system_prompt():
     # were written in the same instant, so their timestamps tie.)
     kept = {int(m["content"].split()[1]) for m in capped[1:]}
     assert kept == set(range(20 - len(kept), 20))
+
+
+def test_capped_agent_stores_each_message_whole():
+    """Messages arrive through agent.update_memory. camel's own version slices
+    a message into one-token "[chunk n/N]" records once the capped context is
+    full; the capped agent must store it as one record instead."""
+    memory = _camel_memory_with_persona()
+    agent = _FakeAgent(memory)
+    sim.cap_agent_context(_FakeGraph([agent]), 300)
+
+    for i in range(20):
+        agent.update_memory(
+            BaseMessage.make_user_message("User", f"round {i} " + "feed " * 50),
+            OpenAIBackendRole.USER, timestamp=1000.0 + i)
+
+    assert len(memory.retrieve()) == 21
+    context, tokens = memory.get_context()
+    assert tokens <= 300
+    assert context[0]["content"] == "persona profile"
+    assert [m["content"].split()[1] for m in context[1:]] == ["15", "16", "17", "18", "19"]
+    assert not any("[chunk" in m["content"] for m in context)
+
+
+def test_capped_agent_shortens_a_message_bigger_than_half_the_cap():
+    memory = _camel_memory_with_persona()
+    agent = _FakeAgent(memory)
+    sim.cap_agent_context(_FakeGraph([agent]), 300)
+
+    agent.update_memory(
+        BaseMessage.make_user_message("User", "old round"), OpenAIBackendRole.USER, timestamp=1.0)
+    agent.update_memory(
+        BaseMessage.make_user_message("User", " ".join(f"w{i}" for i in range(1000))),
+        OpenAIBackendRole.USER, timestamp=2.0)
+
+    context, _ = memory.get_context()
+    newest = context[-1]["content"]
+    assert newest.startswith("w0 w1 w2")
+    assert "w149" in newest and "w150" not in newest
+    assert newest.endswith("[... cut to fit the agent's context limit]")
+    assert context[1]["content"] == "old round"
+
+
+def test_shorten_message_cuts_a_tool_result_and_keeps_the_call():
+    feed = FunctionCallingMessage(
+        role_name="assistant", role_type=BaseMessage.make_assistant_message("a", "").role_type,
+        meta_dict=None, content="", func_name="refresh", args=None,
+        result="post " * 40, tool_call_id="call-1")
+
+    short = sim.shorten_message(feed, _WordCounter(), 10)
+
+    assert short.result.split()[:10] == ["post"] * 10
+    assert short.result.endswith("[... cut to fit the agent's context limit]")
+    assert (short.func_name, short.tool_call_id) == ("refresh", "call-1")
+    assert sim.shorten_message(feed, _WordCounter(), 40) is feed
