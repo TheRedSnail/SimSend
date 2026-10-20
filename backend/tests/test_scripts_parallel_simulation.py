@@ -196,6 +196,30 @@ def test_batch_interview_never_returns_stale_answers(tmp_path):
     assert "error" in results["twitter_2"]
 
 
+class _SlowInterviewEnv(_InterviewEnv):
+    async def step(self, actions):
+        await asyncio.sleep(0.3)
+        await super().step(actions)
+
+
+def test_dual_platform_batch_interviews_both_platforms_at_once(tmp_path):
+    import time
+    dbs = {p: str(tmp_path / f"{p}_simulation.db") for p in ("twitter", "reddit")}
+    for db in dbs.values():
+        _make_trace_db(db, [])
+    handler = sim.ParallelIPCHandler(
+        str(tmp_path),
+        twitter_env=_SlowInterviewEnv(dbs["twitter"], answers=[1]), twitter_agent_graph=_Graph(),
+        reddit_env=_SlowInterviewEnv(dbs["reddit"], answers=[1]), reddit_agent_graph=_Graph())
+
+    started = time.monotonic()
+    assert asyncio.run(handler.handle_batch_interview("cmd1", [{"agent_id": 1, "prompt": "q"}]))
+    assert time.monotonic() - started < 0.55  # not 0.3 + 0.3
+    with open(tmp_path / "ipc_responses" / "cmd1.json", encoding="utf-8") as f:
+        results = json.load(f)["result"]["results"]
+    assert results["twitter_1"]["response"] == results["reddit_1"]["response"] == "fresh 1"
+
+
 def test_process_commands_reports_idle_and_close(tmp_path):
     handler = sim.ParallelIPCHandler(str(tmp_path))
     assert asyncio.run(handler.process_commands()) == (False, True)

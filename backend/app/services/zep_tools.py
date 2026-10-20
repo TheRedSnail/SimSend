@@ -437,6 +437,10 @@ class ZepToolsService:
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
     ZEP_MAX_QUERY_CHARS = 400  # Zep's limit for graph.search queries
+    # A batch of 5-6 agents on both platforms took 2.5-4 minutes in test runs.
+    # Timing out doesn't stop the batch: the next interview would queue behind
+    # it and time out too, so the report would lose all of them.
+    INTERVIEW_TIMEOUT = 600.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
@@ -1418,7 +1422,7 @@ Return a JSON-formatted list of sub-queries."""
                 simulation_id=simulation_id,
                 interviews=interviews_request,
                 platform=None,  # No platform specified, dual-platform interview
-                timeout=180.0   # Dual-platform needs longer timeout
+                timeout=self.INTERVIEW_TIMEOUT
             )
             
             logger.info(f"Interview API returned: {api_result.get('interviews_count', 0)} results, success={api_result.get('success')}")

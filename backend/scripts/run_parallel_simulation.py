@@ -535,9 +535,14 @@ class ParallelIPCHandler:
             if self.reddit_env:
                 reddit_interviews.extend(both_platforms_interviews)
         
+        # Both platforms at once: one after the other, a dual-platform batch took
+        # ~4 minutes and overran the caller's timeout.
         results = {}
-        for platform_name, platform_interviews in (("twitter", twitter_interviews), ("reddit", reddit_interviews)):
-            results.update(await self._batch_interview_platform(platform_name, platform_interviews))
+        for platform_results in await asyncio.gather(
+            self._batch_interview_platform("twitter", twitter_interviews),
+            self._batch_interview_platform("reddit", reddit_interviews),
+        ):
+            results.update(platform_results)
         
         succeeded = sum(1 for r in results.values() if r.get("response") is not None)
         if succeeded:
