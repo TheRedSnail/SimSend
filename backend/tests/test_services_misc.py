@@ -1,4 +1,4 @@
-"""SimulationManager persistence, report-agent tool-call parsing, Zep updater backpressure."""
+"""SimulationManager persistence, report-agent tool-call parsing, Zep updater backpressure and digests."""
 
 import json
 import os
@@ -134,7 +134,7 @@ def _activity(i, platform="twitter"):
 def updater(monkeypatch):
     monkeypatch.setattr(ZepGraphMemoryUpdater, "MAX_QUEUE_SIZE", 10)
     monkeypatch.setattr(ZepGraphMemoryUpdater, "RETRY_DELAY", 0)
-    u = ZepGraphMemoryUpdater("graph_x", api_key="test")
+    u = ZepGraphMemoryUpdater("graph_x", api_key="test", mode="full")
     u.client = _FakeZep()
     return u
 
@@ -176,6 +176,95 @@ def test_stop_is_bounded_when_zep_is_down(updater, monkeypatch):
     updater.stop(flush_timeout=2)
     assert time.monotonic() - started < 6
     assert updater.get_stats()["items_sent"] == 0
+
+
+class _FakeLLM:
+    def __init__(self, reply="summary", fail=False):
+        self.reply, self.fail, self.calls = reply, fail, []
+
+    def chat(self, messages, **kwargs):
+        if self.fail:
+            raise ConnectionError("llm down")
+        self.calls.append((messages[-1]["content"], kwargs))
+        return self.reply
+
+
+def _act(round_num, action_type="CREATE_POST", platform="twitter", **args):
+    return AgentActivity(platform=platform, agent_id=1, agent_name="Ann", action_type=action_type,
+                         action_args=args or {"content": f"post in round {round_num}"},
+                         round_num=round_num, timestamp="t")
+
+
+@pytest.fixture
+def digester(monkeypatch):
+    monkeypatch.setattr(ZepGraphMemoryUpdater, "RETRY_DELAY", 0)
+    u = ZepGraphMemoryUpdater("graph_x", api_key="test", mode="digest", minutes_per_round=60)
+    u.client = _FakeZep()
+    u._llm = _FakeLLM()
+    return u
+
+
+def test_mode_defaults_to_digest_and_reads_env(monkeypatch):
+    monkeypatch.delenv("ZEP_ACTIVITY_MODE", raising=False)
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "digest"
+    monkeypatch.setenv("ZEP_ACTIVITY_MODE", "full")
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "full"
+    monkeypatch.setenv("ZEP_ACTIVITY_MODE", "bogus")
+    assert ZepGraphMemoryUpdater("g", api_key="test").mode == "digest"
+
+
+def test_digest_sends_one_summary_when_the_next_window_starts(digester):
+    for r in (0, 2, 5):
+        digester._buffer_for_digest(_act(r), "twitter")
+    assert digester.client.graph.calls == []  # window 0-6h still open
+    digester._buffer_for_digest(_act(6), "twitter")
+    assert digester.client.graph.calls == ["Day 1, hours 0-6 of the campaign, on Twitter: summary"]
+    prompt, kwargs = digester._llm.calls[0]
+    assert prompt.count("Ann posted:") == 3
+    assert kwargs["reasoning"] is False
+    assert digester.get_stats()["items_sent"] == 3
+
+
+def test_digest_windows_follow_simulated_time(digester):
+    digester.minutes_per_round = 30  # 12 rounds per 6-hour window
+    assert digester._window_of(_act(11)) == 0
+    assert digester._window_of(_act(12)) == 1
+    digester.minutes_per_round = 60
+    assert digester._window_of(_act(47)) == 7  # day 2, hours 42-48
+
+
+def test_digest_lines_drop_parent_text_and_searches():
+    like = _act(1, "LIKE_POST", post_author_name="Bob", post_content="x" * 900)
+    assert like.to_digest_line() == "Ann liked a post by Bob"
+    reply = _act(1, "CREATE_COMMENT", content="y " * 400, post_author_name="Bob", post_content="z" * 900)
+    line = reply.to_digest_line()
+    assert line.startswith('Ann replied to Bob: "y y') and "z" not in line
+    assert len(line) < AgentActivity.DIGEST_OWN_TEXT_CHARS + 40
+    quote = _act(1, "QUOTE_POST", quote_content="mine", original_author_name="Bob", original_content="theirs")
+    assert quote.to_digest_line() == 'Ann quoted Bob: "mine"'
+    assert _act(1, "SEARCH_POSTS", query="velora").to_digest_line() is None
+
+
+def test_digest_falls_back_to_activity_lines_when_llm_fails(digester):
+    digester._llm = _FakeLLM(fail=True)
+    digester._send_digest([_act(0), _act(1)], "reddit")
+    (sent,) = digester.client.graph.calls
+    assert sent.startswith("Day 1, hours 0-6 of the campaign, on Reddit:\n")
+    assert sent.count("Ann posted:") == 2
+
+
+def test_digest_flush_summarises_each_open_window(digester):
+    for r in (0, 7):
+        digester.add_activity(_act(r))
+    digester.add_activity(_act(0, platform="reddit"))
+    digester._flush_remaining(time.monotonic() + 5)
+    assert sorted(c.split(":")[0] for c in digester.client.graph.calls) == [
+        "Day 1, hours 0-6 of the campaign, on Reddit",
+        "Day 1, hours 0-6 of the campaign, on Twitter",
+        "Day 1, hours 6-12 of the campaign, on Twitter",
+    ]
+    assert len(digester._llm.calls) == 3
+
 
 
 def test_zep_search_query_is_cut_to_zeps_limit():

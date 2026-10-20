@@ -529,7 +529,7 @@ class SimulationRunner:
 
             if enable_graph_memory_update:
                 try:
-                    ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
+                    ZepGraphMemoryManager.create_updater(simulation_id, graph_id, minutes_per_round=minutes_per_round)
                     cls._graph_memory_enabled[simulation_id] = True
                     logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
                 except Exception as e:

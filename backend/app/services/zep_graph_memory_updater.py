@@ -14,6 +14,7 @@ from queue import Queue, Empty, Full
 from zep_cloud.client import Zep
 
 from ..config import Config
+from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..utils.retry import call_with_retry, is_transient_error
 
@@ -197,21 +198,73 @@ class AgentActivity:
         # For unknown action types, generate a generic description
         return f"performed a {self.action_type} action"
 
+    # Digest mode keeps the agent's own text up to this length and leaves out
+    # the text of the post it reacts to (that post has its own line).
+    DIGEST_OWN_TEXT_CHARS = 600
+    _DIGEST_SKIPPED = {"DO_NOTHING", "SEARCH_POSTS", "SEARCH_USER", "TREND", "REFRESH"}
+
+    def to_digest_line(self) -> Optional[str]:
+        """Compact one-line form fed to the digest summary; None if not worth summarising."""
+        if self.action_type in self._DIGEST_SKIPPED:
+            return None
+        args = self.action_args or {}
+        who = (args.get("post_author_name") or args.get("original_author_name")
+               or args.get("comment_author_name") or args.get("target_user_name") or "someone")
+        own = args.get("content") or ""
+        if self.action_type == "QUOTE_POST":
+            own = args.get("quote_content") or own
+        own = own.strip()
+        if len(own) > self.DIGEST_OWN_TEXT_CHARS:
+            own = own[:self.DIGEST_OWN_TEXT_CHARS].rsplit(" ", 1)[0] + "..."
+        line = {
+            "CREATE_POST": f'posted: "{own}"',
+            "CREATE_COMMENT": f'replied to {who}: "{own}"',
+            "QUOTE_POST": f'quoted {who}: "{own}"',
+            "REPOST": f"reposted {who}",
+            "LIKE_POST": f"liked a post by {who}",
+            "DISLIKE_POST": f"disliked a post by {who}",
+            "LIKE_COMMENT": f"liked a comment by {who}",
+            "DISLIKE_COMMENT": f"disliked a comment by {who}",
+            "FOLLOW": f"followed {who}",
+            "MUTE": f"muted {who}",
+        }.get(self.action_type)
+        return f"{self.agent_name} {line}" if line else None
+
 
 class ZepGraphMemoryUpdater:
     """
     Zep Graph Memory Updater
 
     Monitors the simulation's actions log file and updates new agent activities
-    to the Zep graph in real-time.
-    Groups activities by platform and sends them in batches after accumulating BATCH_SIZE entries.
+    to the Zep graph in real-time, per platform, in one of two modes
+    (ZEP_ACTIVITY_MODE):
 
-    All meaningful actions are updated to Zep. action_args contains complete context information:
-    - Original post content for likes/dislikes
-    - Original post content for reposts/quotes
-    - Username for follows/mutes
-    - Original comment content for comment likes/dislikes
+    - digest (default): activities are collected per DIGEST_WINDOW_HOURS of
+      simulated time and each window is sent as one LLM-written summary. Zep
+      bills per 350 bytes sent; in a 168-hour test run this used 263 credits
+      where "full" would have used ~5,950, and the report kept its detail
+      (it reads exact posts from the local action log).
+    - full: every action is sent, BATCH_SIZE per episode, with complete
+      context (the text of the post being liked, reposted, quoted or
+      commented on, usernames for follows/mutes).
     """
+
+    MODES = ("digest", "full")
+    DIGEST_WINDOW_HOURS = max(int(os.environ.get("ZEP_DIGEST_WINDOW_HOURS", "6") or 6), 1)
+    # stop() summarises the last open window of each platform, an LLM call each
+    DIGEST_FLUSH_TIMEOUT = 120
+    DIGEST_PROMPT = (
+        "You turn one window of social media activity into a short factual digest for a knowledge graph.\n"
+        "Write plain English prose: one paragraph of at most 150 words (hard limit; longer answers are "
+        "rejected), no markdown, no lists.\n"
+        "Name every account you mention exactly as written. Keep concrete claims, prices, numbers, promises "
+        "and complaints, who agreed with or amplified whom (likes, reposts, quotes, follows), and any change "
+        "of opinion.\n"
+        "Mention brands and competitors by name. Do not add anything that is not in the activity. "
+        "Do not editorialise.\n"
+        "Prioritise: the most discussed claims and positions, and who supported or opposed them. "
+        "Drop minor or repeated items."
+    )
 
     # Batch send size (number of activities to accumulate per platform before sending)
     BATCH_SIZE = 5
@@ -234,13 +287,16 @@ class ZepGraphMemoryUpdater:
     FLUSH_TIMEOUT = float(os.environ.get("SIMSEND_ZEP_FLUSH_TIMEOUT", "30"))
     FLUSH_CHUNK_SIZE = 20  # activities per episode when flushing a backlog
 
-    def __init__(self, graph_id: str, api_key: Optional[str] = None):
+    def __init__(self, graph_id: str, api_key: Optional[str] = None, mode: Optional[str] = None,
+                 minutes_per_round: int = 60):
         """
         Initialize the updater
 
         Args:
             graph_id: Zep graph ID
             api_key: Zep API Key (optional, defaults to config value)
+            mode: "digest" or "full" (optional, defaults to ZEP_ACTIVITY_MODE, else digest)
+            minutes_per_round: Simulated minutes per round, to place activities in digest windows
         """
         self.graph_id = graph_id
         self.api_key = api_key or Config.ZEP_API_KEY
@@ -249,6 +305,13 @@ class ZepGraphMemoryUpdater:
             raise ValueError("ZEP_API_KEY is not configured")
 
         self.client = Zep(api_key=self.api_key)
+
+        self.mode = (mode or os.environ.get("ZEP_ACTIVITY_MODE") or "digest").strip().lower()
+        if self.mode not in self.MODES:
+            logger.warning(f"Unknown Zep activity mode {self.mode!r}; using digest")
+            self.mode = "digest"
+        self.minutes_per_round = max(int(minutes_per_round or 60), 1)
+        self._llm: Optional[LLMClient] = None  # created on first digest
 
         # Activity queue. Bounded: the producer (log monitor) is much faster
         # than Zep ingestion, so an unbounded queue grows without limit on a
@@ -275,7 +338,8 @@ class ZepGraphMemoryUpdater:
         self._skipped_count = 0     # Filtered/skipped activity count (DO_NOTHING)
         self._dropped_count = 0     # Activities dropped (queue overflow or flush timeout)
 
-        logger.info(f"ZepGraphMemoryUpdater initialized: graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
+        logger.info(f"ZepGraphMemoryUpdater initialized: graph_id={graph_id}, mode={self.mode}, "
+                    f"batch_size={self.BATCH_SIZE}, digest_window_hours={self.DIGEST_WINDOW_HOURS}")
 
     def _get_platform_display_name(self, platform: str) -> str:
         """Get platform display name"""
@@ -295,13 +359,17 @@ class ZepGraphMemoryUpdater:
         self._worker_thread.start()
         logger.info(f"ZepGraphMemoryUpdater started: graph_id={self.graph_id}")
 
+    def default_flush_timeout(self) -> float:
+        """How long stop() may spend sending what is pending."""
+        return max(self.FLUSH_TIMEOUT, self.DIGEST_FLUSH_TIMEOUT) if self.mode == "digest" else self.FLUSH_TIMEOUT
+
     def stop(self, flush_timeout: Optional[float] = None):
         """Stop the worker and flush what is pending, within ``flush_timeout`` seconds.
 
         Whatever cannot be sent before the deadline is dropped (and counted)
         rather than blocking the caller indefinitely.
         """
-        timeout = self.FLUSH_TIMEOUT if flush_timeout is None else flush_timeout
+        timeout = self.default_flush_timeout() if flush_timeout is None else flush_timeout
         deadline = time.monotonic() + timeout
         self._drain_deadline = deadline
         self._running = False
@@ -403,6 +471,10 @@ class ZepGraphMemoryUpdater:
                     continue
 
                 platform = activity.platform.lower()
+                if self.mode == "digest":
+                    self._buffer_for_digest(activity, platform)
+                    continue
+
                 batch_size = self.BATCH_SIZE if self._running else self.FLUSH_CHUNK_SIZE
                 batch = None
                 with self._buffer_lock:
@@ -438,29 +510,87 @@ class ZepGraphMemoryUpdater:
 
         # Merge multiple activities into a single text, separated by newlines
         combined_text = "\n".join(activity.to_episode_text() for activity in activities)
+        return self._send_text(combined_text, len(activities), platform)
 
+    def _send_text(self, text: str, item_count: int, platform: str) -> bool:
+        """Send one episode to the graph; True when Zep accepted it."""
         try:
             call_with_retry(
                 self.client.graph.add,
                 graph_id=self.graph_id,
                 type="text",
-                data=combined_text,
+                data=text,
                 max_retries=self.MAX_RETRIES - 1,
                 initial_delay=self.RETRY_DELAY,
                 retry_if=is_transient_error,
                 description="Zep batch send",
             )
         except Exception as e:
-            logger.error(f"Batch send to Zep failed ({len(activities)} activities): {e}")
+            logger.error(f"Batch send to Zep failed ({item_count} activities): {e}")
             self._failed_count += 1
             return False
 
         self._total_sent += 1
-        self._total_items_sent += len(activities)
+        self._total_items_sent += item_count
         display_name = self._get_platform_display_name(platform)
-        logger.info(f"Successfully batch sent {len(activities)} {display_name} activities to graph {self.graph_id}")
-        logger.debug(f"Batch content preview: {combined_text[:200]}...")
+        logger.info(f"Successfully batch sent {item_count} {display_name} activities to graph {self.graph_id}")
+        logger.debug(f"Batch content preview: {text[:200]}...")
         return True
+
+    # ---------------------------------------------------------------- digest mode
+
+    def _window_of(self, activity: AgentActivity) -> int:
+        """Index of the DIGEST_WINDOW_HOURS slice of simulated time the activity falls in."""
+        return int(activity.round_num * self.minutes_per_round / 60 // self.DIGEST_WINDOW_HOURS)
+
+    def _buffer_for_digest(self, activity: AgentActivity, platform: str):
+        """Collect a platform's activities per window; send a window once the next one starts."""
+        closed = None
+        with self._buffer_lock:
+            buffer = self._platform_buffers.setdefault(platform, [])
+            if buffer and self._window_of(activity) != self._window_of(buffer[0]):
+                closed = buffer
+                self._platform_buffers[platform] = []
+            self._platform_buffers[platform].append(activity)
+        if closed:
+            self._send_digest(closed, platform)
+
+    def _send_digest(self, activities: List[AgentActivity], platform: str) -> bool:
+        """Send one window of activities as a single summary episode."""
+        lines = [line for line in (a.to_digest_line() for a in activities) if line]
+        if not lines:
+            self._skipped_count += len(activities)
+            return True
+
+        start = self._window_of(activities[0]) * self.DIGEST_WINDOW_HOURS
+        header = (f"Day {start // 24 + 1}, hours {start}-{start + self.DIGEST_WINDOW_HOURS} "
+                  f"of the campaign, on {platform.capitalize()}")
+        summary = self._summarise(header, lines)
+        if summary:
+            return self._send_text(f"{header}: {summary}", len(lines), platform)
+
+        # No summary: send the compact lines instead, so the window isn't lost
+        ok = True
+        for i in range(0, len(lines), self.FLUSH_CHUNK_SIZE):
+            chunk = lines[i:i + self.FLUSH_CHUNK_SIZE]
+            ok = self._send_text(f"{header}:\n" + "\n".join(chunk), len(chunk), platform) and ok
+        return ok
+
+    def _summarise(self, header: str, lines: List[str]) -> str:
+        """LLM digest of one window, or '' when the LLM is unavailable."""
+        try:
+            if self._llm is None:
+                self._llm = LLMClient()
+            return self._llm.chat(
+                [{"role": "system", "content": self.DIGEST_PROMPT},
+                 {"role": "user", "content": f"{header}:\n" + "\n".join(lines)}],
+                temperature=0.2,
+                max_tokens=1500,
+                reasoning=False,
+            ).strip()
+        except Exception as e:
+            logger.warning(f"Activity digest failed, sending the activities unsummarised: {e}")
+            return ""
 
     def _flush_remaining(self, deadline: Optional[float] = None):
         """Send what is left in the queue and buffers, in bounded chunks, until ``deadline``."""
@@ -483,17 +613,26 @@ class ZepGraphMemoryUpdater:
         for platform, items in pending.items():
             if items:
                 logger.info(f"Sending remaining {len(items)} {self._get_platform_display_name(platform)} activities")
-            # Chunked: one giant episode can exceed Zep's size limit and then
-            # fails (and is lost) as a whole.
-            for start in range(0, len(items), self.FLUSH_CHUNK_SIZE):
+            if self.mode == "digest":
+                # One summary per window still open
+                windows: Dict[int, List[AgentActivity]] = {}
+                for activity in items:
+                    windows.setdefault(self._window_of(activity), []).append(activity)
+                groups, send = list(windows.values()), self._send_digest
+            else:
+                # Chunked: one giant episode can exceed Zep's size limit and then
+                # fails (and is lost) as a whole.
+                groups = [items[i:i + self.FLUSH_CHUNK_SIZE] for i in range(0, len(items), self.FLUSH_CHUNK_SIZE)]
+                send = self._send_batch_activities
+            for n, group in enumerate(groups):
                 if time.monotonic() >= deadline:
-                    left = len(items) - start
+                    left = sum(len(g) for g in groups[n:])
                     self._dropped_count += left
                     logger.warning(
                         f"Zep flush timed out; dropped {left} {platform} activities (graph={self.graph_id})"
                     )
                     break
-                self._send_batch_activities(items[start:start + self.FLUSH_CHUNK_SIZE], platform)
+                send(group, platform)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -502,6 +641,7 @@ class ZepGraphMemoryUpdater:
 
         return {
             "graph_id": self.graph_id,
+            "mode": self.mode,
             "batch_size": self.BATCH_SIZE,
             "total_activities": self._total_activities,  # Total activities added to queue
             "batches_sent": self._total_sent,            # Successfully sent batch count
@@ -526,13 +666,14 @@ class ZepGraphMemoryManager:
     _lock = threading.Lock()
 
     @classmethod
-    def create_updater(cls, simulation_id: str, graph_id: str) -> ZepGraphMemoryUpdater:
+    def create_updater(cls, simulation_id: str, graph_id: str, minutes_per_round: int = 60) -> ZepGraphMemoryUpdater:
         """
         Create a graph memory updater for a simulation
 
         Args:
             simulation_id: Simulation ID
             graph_id: Zep graph ID
+            minutes_per_round: Simulated minutes per round (places activities in digest windows)
 
         Returns:
             ZepGraphMemoryUpdater instance
@@ -544,7 +685,7 @@ class ZepGraphMemoryManager:
                 threading.Thread(target=old.stop, daemon=True,
                                  name=f"ZepFlush-{simulation_id}").start()
 
-            updater = ZepGraphMemoryUpdater(graph_id)
+            updater = ZepGraphMemoryUpdater(graph_id, minutes_per_round=minutes_per_round)
             updater.start()
             cls._updaters[simulation_id] = updater
 
@@ -600,8 +741,9 @@ class ZepGraphMemoryManager:
         threads = [threading.Thread(target=stop_one, args=item, daemon=True) for item in updaters]
         for t in threads:
             t.start()
+        join_timeout = max((u.default_flush_timeout() for _, u in updaters), default=0) + 5
         for t in threads:
-            t.join(timeout=ZepGraphMemoryUpdater.FLUSH_TIMEOUT + 5)
+            t.join(timeout=join_timeout)
         logger.info("All graph memory updaters stopped")
 
     @classmethod
