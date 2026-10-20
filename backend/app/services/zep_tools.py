@@ -436,6 +436,7 @@ class ZepToolsService:
     # Retry configuration
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
+    ZEP_MAX_QUERY_CHARS = 400  # Zep's limit for graph.search queries
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
@@ -493,13 +494,15 @@ class ZepToolsService:
             SearchResult: Search results
         """
         logger.info(f"Graph search: graph_id={graph_id}, query={query[:50]}...")
-        
-        # Try using Zep Cloud Search API
+
+        # Try using Zep Cloud Search API. Zep rejects queries longer than its
+        # limit outright (HTTP 400), and the report agent often writes long ones.
+        zep_query = query[:self.ZEP_MAX_QUERY_CHARS]
         try:
             search_results = self._call_with_retry(
                 func=lambda: self.client.graph.search(
                     graph_id=graph_id,
-                    query=query,
+                    query=zep_query,
                     limit=limit,
                     scope=scope,
                     reranker="cross_encoder"

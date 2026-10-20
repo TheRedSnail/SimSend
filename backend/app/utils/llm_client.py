@@ -21,7 +21,7 @@ class LLMClient:
     # Retry policy for transient API failures.
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 120.0  # seconds; a hung provider must not stall pipelines
-    MAX_JSON_TOKENS = 16384  # ceiling when chat_json grows the budget after truncation
+    MAX_TOKENS_CEILING = 16384  # ceiling when a reply cut off at the token limit is retried with more
 
     def __init__(
         self,
@@ -50,7 +50,8 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        reasoning: Optional[bool] = None
     ) -> str:
         """
         Send a chat request
@@ -60,6 +61,9 @@ class LLMClient:
             temperature: Temperature parameter
             max_tokens: Maximum number of tokens
             response_format: Response format (e.g., JSON mode)
+            reasoning: False asks the model to skip hidden reasoning (OpenRouter
+                only; ignored for other providers). Faster and cheaper for
+                summarising, where reasoning adds nothing.
 
         Returns:
             Model response text. May be '' (content filter, tool-only or empty
@@ -74,14 +78,29 @@ class LLMClient:
 
         if response_format:
             kwargs["response_format"] = response_format
+        if reasoning is False and "openrouter.ai" in (self.base_url or ""):
+            kwargs["extra_body"] = {"reasoning": {"enabled": False}}
 
-        # Retry transient failures (timeouts, 429, 5xx) with exponential backoff
-        # so a single network blip doesn't abort a long pipeline. Permanent
-        # errors (bad request, auth) are raised immediately.
-        return self._complete(kwargs)[0]
+        while True:
+            content, finish_reason = self._complete(kwargs)
+            # Reasoning models spend max_tokens on hidden reasoning before they
+            # answer. When that uses the whole budget the reply is empty, so
+            # retry with a bigger one instead of returning nothing.
+            if content or finish_reason != 'length' or kwargs["max_tokens"] >= self.MAX_TOKENS_CEILING:
+                return content
+            kwargs["max_tokens"] = min(kwargs["max_tokens"] * 2, self.MAX_TOKENS_CEILING)
+            logger.warning(
+                "LLM used its whole token budget without replying; retrying with max_tokens=%d",
+                kwargs["max_tokens"],
+            )
 
     def _complete(self, kwargs: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-        """Run one completion; return (content, finish_reason)."""
+        """Run one completion; return (content, finish_reason).
+
+        Transient failures (timeouts, 429, 5xx) are retried with exponential
+        backoff so a single network blip doesn't abort a long pipeline.
+        Permanent errors (bad request, auth) are raised immediately.
+        """
         response = call_with_retry(
             self.client.chat.completions.create,
             max_retries=self.MAX_RETRIES - 1,
@@ -131,9 +150,9 @@ class LLMClient:
             # models spend part of max_tokens on hidden reasoning, so retry with
             # a bigger budget rather than parsing (or "repairing") a truncated
             # object and silently losing its tail.
-            if finish_reason != 'length' or kwargs["max_tokens"] >= self.MAX_JSON_TOKENS:
+            if finish_reason != 'length' or kwargs["max_tokens"] >= self.MAX_TOKENS_CEILING:
                 break
-            kwargs["max_tokens"] = min(kwargs["max_tokens"] * 2, self.MAX_JSON_TOKENS)
+            kwargs["max_tokens"] = min(kwargs["max_tokens"] * 2, self.MAX_TOKENS_CEILING)
             logger.warning(
                 "LLM JSON response truncated at the token limit; retrying with max_tokens=%d",
                 kwargs["max_tokens"],

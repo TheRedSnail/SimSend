@@ -176,3 +176,19 @@ def test_stop_is_bounded_when_zep_is_down(updater, monkeypatch):
     updater.stop(flush_timeout=2)
     assert time.monotonic() - started < 6
     assert updater.get_stats()["items_sent"] == 0
+
+
+def test_zep_search_query_is_cut_to_zeps_limit():
+    from types import SimpleNamespace
+    from app.services.zep_tools import ZepToolsService
+    seen = {}
+
+    def search(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(edges=[], nodes=[])
+
+    tools = ZepToolsService.__new__(ZepToolsService)
+    tools.client = SimpleNamespace(graph=SimpleNamespace(search=search))
+    result = tools.search_graph("g", "q" * 900)
+    assert len(seen["query"]) == ZepToolsService.ZEP_MAX_QUERY_CHARS
+    assert result.query == "q" * 900
