@@ -79,9 +79,23 @@ def agent():
      {"name": "quick_search", "parameters": {"query": "q"}}),
     ('Thinking...\n{"name": "quick_search", "args": {"query": "q"}}',
      {"name": "quick_search", "parameters": {"query": "q"}}),
+    # Seen from DeepSeek: wrong closing tag, parameters next to the name
+    ('Let me search.<tool_call>\n{"name": "quick_search", "query": "q", "limit": 15}\n</tool_action>\n',
+     {"name": "quick_search", "parameters": {"query": "q", "limit": 15}}),
+    ('<tool_call>{"name": "panorama_search", "parameters": {"query": "q"}}',
+     {"name": "panorama_search", "parameters": {"query": "q"}}),
 ])
 def test_tool_call_variants_are_normalized(agent, payload, expected):
     assert agent._parse_tool_calls(payload) == [expected]
+
+
+@pytest.mark.parametrize("response, expected", [
+    ("Done.\n\n**Final Answer:**\n\nThe week split by segment.", "The week split by segment."),
+    ("Final Answer: **Students** stayed.", "**Students** stayed."),
+    ("Final Answer:Plain", "Plain"),
+])
+def test_final_answer_marker_is_removed_with_its_bold(response, expected):
+    assert ReportAgent._after_final_answer(response) == expected
 
 
 def test_unknown_or_malformed_tool_calls_are_ignored(agent):
