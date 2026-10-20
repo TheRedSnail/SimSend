@@ -84,6 +84,16 @@ def agent():
      {"name": "quick_search", "parameters": {"query": "q", "limit": 15}}),
     ('<tool_call>{"name": "panorama_search", "parameters": {"query": "q"}}',
      {"name": "panorama_search", "parameters": {"query": "q"}}),
+    # DeepSeek's native markup, alone or closing a JSON call
+    ('<tool_call>\n{"name": "quick_search", "parameters": {"query": "q"}}\n</｜DSML｜tool_call>',
+     {"name": "quick_search", "parameters": {"query": "q"}}),
+    ('<｜DSML｜tool_call>\n<｜DSML｜tool_name>interview_agents</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="interview_topic">How do you feel?</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="max_agents">6</｜DSML｜parameter>\n</｜DSML｜tool_call>',
+     {"name": "interview_agents", "parameters": {"interview_topic": "How do you feel?", "max_agents": 6}}),
+    ('<｜DSML｜tool_call>\n<｜DSML｜parameter name="limit">15</｜DSML｜parameter>\n'
+     '<｜DSML｜parameter name="name">simulation_activity</｜DSML｜parameter>\n</｜DSML｜tool_call>',
+     {"name": "simulation_activity", "parameters": {"limit": 15}}),
 ])
 def test_tool_call_variants_are_normalized(agent, payload, expected):
     assert agent._parse_tool_calls(payload) == [expected]

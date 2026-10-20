@@ -1331,8 +1331,9 @@ class ReportAgent:
         tool_calls = []
 
         # Format 1: XML style (standard format). Models sometimes close it with
-        # another tag (</tool_action>) or not at all; the JSON is what matters.
-        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*(?=</tool_\w*>|<tool_call>|$)'
+        # another tag (</tool_action>, DeepSeek's </｜DSML｜tool_call>) or not at
+        # all; the JSON is what matters.
+        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*(?=</[^>]*>|<tool_call>|$)'
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
                 call_data = json.loads(match.group(1))
@@ -1368,7 +1369,30 @@ class ReportAgent:
             except json.JSONDecodeError:
                 pass
 
+        if not tool_calls:
+            tool_calls = self._parse_dsml_tool_calls(response)
         return tool_calls
+
+    _DSML_CALL = re.compile(r'<｜DSML｜tool_call>(.*?)(?:</｜DSML｜tool_call>|$)', re.DOTALL)
+    _DSML_NAME = re.compile(r'<｜DSML｜tool_name>\s*([\w-]+)')
+    _DSML_PARAM = re.compile(r'<｜DSML｜parameter name="([^"]+)">(.*?)</｜DSML｜parameter>', re.DOTALL)
+
+    def _parse_dsml_tool_calls(self, response: str) -> List[Dict[str, Any]]:
+        """DeepSeek sometimes falls back to its native tool-call markup:
+        <｜DSML｜tool_call><｜DSML｜tool_name>x</...><｜DSML｜parameter name="k">v</...>..."""
+        calls = []
+        for block in self._DSML_CALL.findall(response):
+            data: Dict[str, Any] = {}
+            name = self._DSML_NAME.search(block)
+            if name:
+                data["name"] = name.group(1)
+            for key, value in self._DSML_PARAM.findall(block):
+                value = value.strip()
+                data[key] = int(value) if value.isdigit() else value
+            normalized = self._normalize_tool_call(data)
+            if normalized:
+                calls.append(normalized)
+        return calls
 
     _TOOL_NAME_KEYS = ("name", "tool", "tool_name", "function")
     _TOOL_PARAM_KEYS = ("parameters", "params", "arguments", "args", "input")
@@ -1804,7 +1828,7 @@ class ReportAgent:
 
             # A tool call we couldn't parse is not section content: saving it
             # would put the model's working notes into the report.
-            if "<tool_call" in response:
+            if re.search(r"<[^>]{0,12}tool_call", response):
                 logger.warning(f"Section {section.title} iteration {iteration + 1}: unparseable tool call, asking again")
                 messages.append({"role": "user", "content": REACT_MALFORMED_TOOL_CALL_MSG})
                 continue
