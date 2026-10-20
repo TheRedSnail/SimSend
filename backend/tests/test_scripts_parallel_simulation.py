@@ -210,3 +210,184 @@ def test_status_file_written_atomically(tmp_path):
     with open(handler.status_file, encoding="utf-8") as f:
         assert json.load(f)["status"] == "alive"
     assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
+
+
+# ------------------------------------------------------------- agent context cap
+
+from camel.memories import ChatHistoryMemory, MemoryRecord, ScoreBasedContextCreator  # noqa: E402
+from camel.messages import BaseMessage, FunctionCallingMessage  # noqa: E402
+from camel.types import OpenAIBackendRole  # noqa: E402
+from camel.utils import BaseTokenCounter  # noqa: E402
+
+
+class _WordCounter(BaseTokenCounter):
+    """One token per word, so budgets in these tests are easy to reason about."""
+
+    def count_tokens_from_messages(self, messages):
+        return sum(len(str(m.get("content", "")).split()) for m in messages)
+
+    def encode(self, text):
+        return text.split()
+
+    def decode(self, token_ids):
+        return " ".join(token_ids)
+
+
+class _FakeCreator:
+    def __init__(self):
+        self._token_limit = 1_000_000
+        self.token_counter = _WordCounter()
+
+
+class _FakeMemory:
+    def __init__(self):
+        self.creator = _FakeCreator()
+
+    def get_context_creator(self):
+        return self.creator
+
+
+class _FakeAgent:
+    agent_id = "agent-0"
+
+    def __init__(self, memory=None):
+        self.memory = memory or _FakeMemory()
+
+
+class _FakeGraph:
+    def __init__(self, agents):
+        self._agents = agents
+
+    def get_agents(self):
+        return list(enumerate(self._agents))
+
+
+def _camel_memory_with_persona():
+    memory = ChatHistoryMemory(ScoreBasedContextCreator(_WordCounter(), 1_000_000))
+    memory.write_records([MemoryRecord(
+        message=BaseMessage.make_assistant_message("system", "persona profile"),
+        role_at_backend=OpenAIBackendRole.SYSTEM)])
+    return memory
+
+
+def test_cap_agent_context_sets_every_agents_limit():
+    agents = [_FakeAgent(), _FakeAgent(), object()]  # the last has no memory
+    assert sim.cap_agent_context(_FakeGraph(agents), 12000) == 2
+    assert all(a.memory.creator._token_limit == 12000 for a in agents[:2])
+
+
+def test_cap_agent_context_disabled():
+    agent = _FakeAgent()
+    assert sim.cap_agent_context(_FakeGraph([agent]), None) == 0
+    assert agent.memory.creator._token_limit == 1_000_000
+    assert "update_memory" not in vars(agent)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+    ("", sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+    ("8000", 8000),
+    ("0", None),
+    ("lots", sim.DEFAULT_SWARM_CONTEXT_TOKENS),
+])
+def test_swarm_context_token_limit_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("SWARM_CONTEXT_TOKEN_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("SWARM_CONTEXT_TOKEN_LIMIT", raw)
+    assert sim.swarm_context_token_limit() == expected
+
+
+@pytest.mark.parametrize("level, expected", [("light", 12000), ("medium", 24000), ("heavy", None)])
+def test_agent_memory_level_overrides_env(monkeypatch, level, expected):
+    monkeypatch.setenv("SWARM_CONTEXT_TOKEN_LIMIT", "5000")
+    assert sim.swarm_context_token_limit(level) == expected
+
+
+def test_agent_memory_cli_flag():
+    assert sim.parse_args(["--config", "c.json"]).agent_memory is None
+    assert sim.parse_args(["--config", "c.json", "--agent-memory", "heavy"]).agent_memory == "heavy"
+    with pytest.raises(SystemExit):
+        sim.parse_args(["--config", "c.json", "--agent-memory", "huge"])
+
+
+def test_agent_memory_levels_match_the_backend():
+    from app.services.simulation_runner import SimulationRunner
+    assert set(sim.AGENT_MEMORY_LEVELS) == set(SimulationRunner.AGENT_MEMORY_LEVELS)
+
+
+def test_capped_camel_context_drops_oldest_turns_and_keeps_system_prompt():
+    """Guards the private attribute against camel changes: the real context
+    creator must truncate against the value cap_agent_context sets."""
+    memory = _camel_memory_with_persona()
+    for i in range(20):
+        memory.write_records([MemoryRecord(
+            message=BaseMessage.make_user_message("User", f"round {i} " + "feed " * 50),
+            role_at_backend=OpenAIBackendRole.USER)])
+
+    uncapped, uncapped_tokens = memory.get_context()
+
+    sim.cap_agent_context(_FakeGraph([_FakeAgent(memory)]), 300)
+    capped, capped_tokens = memory.get_context()
+
+    assert len(capped) < len(uncapped)
+    assert capped_tokens <= 300 < uncapped_tokens
+    assert capped[0]["content"] == "persona profile"
+    # The newest turns survive. (Their order here is arbitrary: the records
+    # were written in the same instant, so their timestamps tie.)
+    kept = {int(m["content"].split()[1]) for m in capped[1:]}
+    assert kept == set(range(20 - len(kept), 20))
+
+
+def test_capped_agent_stores_each_message_whole():
+    """Messages arrive through agent.update_memory. camel's own version slices
+    a message into one-token "[chunk n/N]" records once the capped context is
+    full; the capped agent must store it as one record instead."""
+    memory = _camel_memory_with_persona()
+    agent = _FakeAgent(memory)
+    sim.cap_agent_context(_FakeGraph([agent]), 300)
+
+    for i in range(20):
+        agent.update_memory(
+            BaseMessage.make_user_message("User", f"round {i} " + "feed " * 50),
+            OpenAIBackendRole.USER, timestamp=1000.0 + i)
+
+    assert len(memory.retrieve()) == 21
+    context, tokens = memory.get_context()
+    assert tokens <= 300
+    assert context[0]["content"] == "persona profile"
+    assert [m["content"].split()[1] for m in context[1:]] == ["15", "16", "17", "18", "19"]
+    assert not any("[chunk" in m["content"] for m in context)
+
+
+def test_capped_agent_shortens_a_message_bigger_than_half_the_cap():
+    memory = _camel_memory_with_persona()
+    agent = _FakeAgent(memory)
+    sim.cap_agent_context(_FakeGraph([agent]), 300)
+
+    agent.update_memory(
+        BaseMessage.make_user_message("User", "old round"), OpenAIBackendRole.USER, timestamp=1.0)
+    agent.update_memory(
+        BaseMessage.make_user_message("User", " ".join(f"w{i}" for i in range(1000))),
+        OpenAIBackendRole.USER, timestamp=2.0)
+
+    context, _ = memory.get_context()
+    newest = context[-1]["content"]
+    assert newest.startswith("w0 w1 w2")
+    assert "w149" in newest and "w150" not in newest
+    assert newest.endswith("[... cut to fit the agent's context limit]")
+    assert context[1]["content"] == "old round"
+
+
+def test_shorten_message_cuts_a_tool_result_and_keeps_the_call():
+    feed = FunctionCallingMessage(
+        role_name="assistant", role_type=BaseMessage.make_assistant_message("a", "").role_type,
+        meta_dict=None, content="", func_name="refresh", args=None,
+        result="post " * 40, tool_call_id="call-1")
+
+    short = sim.shorten_message(feed, _WordCounter(), 10)
+
+    assert short.result.split()[:10] == ["post"] * 10
+    assert short.result.endswith("[... cut to fit the agent's context limit]")
+    assert (short.func_name, short.tool_call_id) == ("refresh", "call-1")
+    assert sim.shorten_message(feed, _WordCounter(), 40) is feed

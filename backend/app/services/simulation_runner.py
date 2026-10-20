@@ -218,7 +218,11 @@ class SimulationRunner:
         os.path.dirname(__file__),
         '../../scripts'
     )
-    
+
+    # How much of its own history each agent keeps; the script maps these to
+    # token caps (AGENT_MEMORY_LEVELS in run_parallel_simulation.py).
+    AGENT_MEMORY_LEVELS = ("light", "medium", "heavy")
+
     # In-memory run states
     _run_states: Dict[str, SimulationRunState] = {}
     _processes: Dict[str, subprocess.Popen] = {}
@@ -440,7 +444,8 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # Max simulation rounds (optional, to truncate overly long simulations)
         enable_graph_memory_update: bool = False,  # Whether to update activities to Zep graph
-        graph_id: str = None  # Zep graph ID (required when graph update is enabled)
+        graph_id: str = None,  # Zep graph ID (required when graph update is enabled)
+        agent_memory: str = None  # light / medium / heavy (optional)
     ) -> SimulationRunState:
         """
         Start simulation
@@ -451,6 +456,8 @@ class SimulationRunner:
             max_rounds: Max simulation rounds (optional, to truncate overly long simulations)
             enable_graph_memory_update: Whether to dynamically update Agent activities to Zep graph
             graph_id: Zep graph ID (required when graph update is enabled)
+            agent_memory: How much history each agent keeps (light/medium/heavy);
+                when omitted the script uses SWARM_CONTEXT_TOKEN_LIMIT or medium
 
         Returns:
             SimulationRunState
@@ -460,6 +467,8 @@ class SimulationRunner:
             raise ValueError(f"Unsupported platform: {platform}")
         if enable_graph_memory_update and not graph_id:
             raise ValueError("graph_id is required when graph memory update is enabled")
+        if agent_memory is not None and agent_memory not in cls.AGENT_MEMORY_LEVELS:
+            raise ValueError(f"Unsupported agent memory level: {agent_memory}")
 
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         config_path = os.path.join(sim_dir, "simulation_config.json")
@@ -541,7 +550,9 @@ class SimulationRunner:
                 cmd.append("--reddit-only")
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
-            
+            if agent_memory:
+                cmd.extend(["--agent-memory", agent_memory])
+
             # stdout/stderr go to a file so a full pipe buffer can never block the child
             main_log_path = os.path.join(sim_dir, "simulation.log")
             main_log_file = open(main_log_path, 'w', encoding='utf-8')

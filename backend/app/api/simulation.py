@@ -1441,8 +1441,15 @@ def start_simulation():
             "platform": "parallel",                // Optional: twitter / reddit / parallel (default)
             "max_rounds": 100,                     // Optional: max simulation rounds, to truncate overly long simulations
             "enable_graph_memory_update": false,   // Optional: whether to dynamically update Agent activities to Zep graph memory
+            "agent_memory": "medium",              // Optional: light / medium / heavy, how much history each agent keeps
             "force": false                         // Optional: force restart (stops running simulation and clears logs)
         }
+
+    About agent_memory:
+        - light: each agent keeps its last ~12k tokens of history (cheapest)
+        - medium: ~24k tokens
+        - heavy: everything (no cap); cost grows with run length
+        - Omitted: SWARM_CONTEXT_TOKEN_LIMIT from the environment, else medium
 
     About the force parameter:
         - When enabled, if simulation is running or completed, it will first stop and clear run logs
@@ -1492,6 +1499,9 @@ def start_simulation():
             data.get('enable_graph_memory_update'), 'enable_graph_memory_update'
         )
         force = parse_bool(data.get('force'), 'force')  # Optional: force restart
+        agent_memory = parse_platform(
+            data.get('agent_memory'), SimulationRunner.AGENT_MEMORY_LEVELS, name='agent_memory'
+        )
 
         # Check if simulation is ready
         manager = SimulationManager()
@@ -1574,7 +1584,8 @@ def start_simulation():
             platform=platform,
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id
+            graph_id=graph_id,
+            agent_memory=agent_memory
         )
         
         # Update simulation status
@@ -1585,6 +1596,8 @@ def start_simulation():
         if max_rounds:
             response_data['max_rounds_applied'] = max_rounds
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
+        if agent_memory:
+            response_data['agent_memory'] = agent_memory
         response_data['force_restarted'] = force_restarted
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id

@@ -66,6 +66,7 @@ if sys.platform == 'win32':
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import random
@@ -106,8 +107,13 @@ class MaxTokensWarningFilter(logging.Filter):
     """Filter out camel-ai max_tokens warnings (we intentionally don't set max_tokens, letting the model decide)"""
     
     def filter(self, record):
+        message = record.getMessage()
         # Filter out log entries containing max_tokens warnings
-        if "max_tokens" in record.getMessage() and "Invalid or missing" in record.getMessage():
+        if "max_tokens" in message and "Invalid or missing" in message:
+            return False
+        # Expected on every call once an agent's history exceeds the context
+        # cap (see cap_agent_context); not worth a line per call.
+        if message.startswith("Context truncation performed"):
             return False
         return True
 
@@ -180,6 +186,8 @@ def init_logging_for_simulation(simulation_dir: str):
 from action_logger import SimulationLogManager, PlatformActionLogger
 
 try:
+    from camel.memories import MemoryRecord
+    from camel.messages import FunctionCallingMessage
     from camel.models import ModelFactory
     from camel.types import ModelPlatformType
     import oasis
@@ -1161,6 +1169,89 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     return ModelFactory.create(**create_kwargs)
 
 
+# Each OASIS agent keeps its whole chat history (every round's feed snapshot
+# plus its own tool calls), and camel sends all of it on every call unless the
+# agent's context has a token limit. The default limit is the model's context
+# window (about 1M tokens for DeepSeek V4 Flash), so prompts, and cost, grew
+# every round: a full 168-round run cost ~10x more in its second half than in
+# its first. With a cap, camel drops the oldest turns first, keeps each tool
+# call together with its result, and always keeps the persona's system prompt.
+#
+# The cap must only apply when the prompt is built, not when messages are
+# stored. camel's ChatAgent.update_memory slices any message bigger than the
+# budget left in the (already truncated) context, and once an agent is full
+# that budget is ~0, so every feed snapshot was stored as thousands of
+# one-token "[chunk n/N]" records. Agents then saw a garbled tail of their
+# feed: in a measured run they commented 75% less and searched instead.
+# Capped agents therefore store each message whole, shortened only if it alone
+# would take more than half the cap.
+#
+# Users pick a level per run (--agent-memory). In a measured 168-round run,
+# light cost ~90% less than no cap; agents stayed coherent but forgot more of
+# the early week and repeated themselves more often.
+AGENT_MEMORY_LEVELS = {"light": 12000, "medium": 24000, "heavy": None}
+DEFAULT_SWARM_CONTEXT_TOKENS = AGENT_MEMORY_LEVELS["medium"]
+
+
+def swarm_context_token_limit(agent_memory: Optional[str] = None) -> Optional[int]:
+    """Per-agent context cap (None = no cap): the run's agent memory level if one
+    was picked, else SWARM_CONTEXT_TOKEN_LIMIT (0 = no cap), else medium."""
+    if agent_memory:
+        return AGENT_MEMORY_LEVELS[agent_memory]
+    raw = os.environ.get("SWARM_CONTEXT_TOKEN_LIMIT", "").strip()
+    if not raw:
+        return DEFAULT_SWARM_CONTEXT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"Ignoring invalid SWARM_CONTEXT_TOKEN_LIMIT={raw!r}; using {DEFAULT_SWARM_CONTEXT_TOKENS}")
+        return DEFAULT_SWARM_CONTEXT_TOKENS
+    return value if value > 0 else None
+
+
+def cap_agent_context(agent_graph, token_limit: Optional[int]) -> int:
+    """Cap every agent's context at ``token_limit`` tokens; returns how many were capped."""
+    if not token_limit:
+        return 0
+    capped = 0
+    for _, agent in agent_graph.get_agents():
+        memory = getattr(agent, "memory", None)
+        creator = memory.get_context_creator() if hasattr(memory, "get_context_creator") else None
+        # ScoreBasedContextCreator exposes token_limit read-only; the value it
+        # truncates against is _token_limit.
+        if creator is not None and hasattr(creator, "_token_limit"):
+            creator._token_limit = token_limit
+            agent.update_memory = _whole_message_memory_writer(
+                agent, creator.token_counter, token_limit // 2)
+            capped += 1
+    return capped
+
+
+def _whole_message_memory_writer(agent, token_counter, max_message_tokens: int):
+    """Stand-in for camel's ChatAgent.update_memory that never slices a message."""
+    def update_memory(message, role, timestamp: Optional[float] = None) -> None:
+        agent.memory.write_record(MemoryRecord(
+            message=shorten_message(message, token_counter, max_message_tokens),
+            role_at_backend=role,
+            timestamp=timestamp if timestamp is not None else time.time_ns() / 1_000_000_000,
+            agent_id=agent.agent_id,
+        ))
+    return update_memory
+
+
+def shorten_message(message, token_counter, max_tokens: int):
+    """Keep the first ``max_tokens`` tokens of a message's text (a tool result's, if it has one)."""
+    field = "result" if isinstance(message, FunctionCallingMessage) and isinstance(message.result, str) else "content"
+    text = getattr(message, field)
+    if not isinstance(text, str):
+        return message
+    token_ids = token_counter.encode(text)
+    if len(token_ids) <= max_tokens:
+        return message
+    short = token_counter.decode(token_ids[:max_tokens]) + "\n[... cut to fit the agent's context limit]"
+    return dataclasses.replace(message, **{field: short})
+
+
 def get_active_agents_for_round(
     env,
     config: Dict[str, Any],
@@ -1280,7 +1371,8 @@ async def run_platform_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    agent_memory: Optional[str] = None
 ) -> PlatformSimulation:
     """Run one platform's simulation loop.
 
@@ -1328,6 +1420,14 @@ async def run_platform_simulation(
                 profile_path=profile_path, model=model, available_actions=REDDIT_ACTIONS,
             )
             platform_type = oasis.DefaultPlatformType.REDDIT
+
+        context_limit = swarm_context_token_limit(agent_memory)
+        capped = cap_agent_context(result.agent_graph, context_limit)
+        memory_label = f"agent memory: {agent_memory}" if agent_memory else "SWARM_CONTEXT_TOKEN_LIMIT/default"
+        if context_limit:
+            log_info(f"Agent context capped at {context_limit} tokens ({capped} agents, {memory_label})")
+        else:
+            log_info(f"Agent context cap disabled ({memory_label})")
 
         # Real entity names instead of generic Agent_X labels
         agent_names = get_agent_names_from_config(config)
@@ -1505,6 +1605,13 @@ def parse_args(argv=None):
         help='Maximum simulation rounds (optional, for truncating overly long simulations)'
     )
     parser.add_argument(
+        '--agent-memory',
+        choices=sorted(AGENT_MEMORY_LEVELS),
+        default=None,
+        help='How much of its own history each agent keeps: light (12k tokens), medium (24k), '
+             'heavy (no cap). Default: SWARM_CONTEXT_TOKEN_LIMIT, else medium'
+    )
+    parser.add_argument(
         '--no-wait',
         action='store_true',
         default=False,
@@ -1570,7 +1677,8 @@ async def main(argv=None) -> int:
     
     # return_exceptions=True so one platform raising doesn't cancel the sibling.
     raw_results = await asyncio.gather(
-        *(run_platform_simulation(p, config, simulation_dir, platform_loggers[p](), log_manager, args.max_rounds)
+        *(run_platform_simulation(p, config, simulation_dir, platform_loggers[p](), log_manager,
+                                  args.max_rounds, args.agent_memory)
           for p in platforms),
         return_exceptions=True,
     )

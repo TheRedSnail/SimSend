@@ -320,6 +320,7 @@ import { usePolling, useDisposed } from '../composables/usePolling'
 const props = defineProps({
   simulationId: String,
   maxRounds: Number, // Max rounds from Step2
+  agentMemory: String, // Agent memory level from Step2 (light / medium / heavy)
   minutesPerRound: {
     type: Number,
     default: 30 // Default 30 minutes per round
@@ -489,6 +490,11 @@ const doStartSimulation = async ({ force = false } = {}) => {
     if (props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(`Setting max simulation rounds: ${props.maxRounds}`)
+    }
+
+    if (props.agentMemory) {
+      params.agent_memory = props.agentMemory
+      addLog(`Agent memory: ${props.agentMemory}`)
     }
 
     addLog('Dynamic graph memory update mode enabled')
