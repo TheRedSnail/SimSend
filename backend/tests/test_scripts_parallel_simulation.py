@@ -298,6 +298,24 @@ def test_swarm_context_token_limit_env(monkeypatch, raw, expected):
     assert sim.swarm_context_token_limit() == expected
 
 
+@pytest.mark.parametrize("level, expected", [("light", 12000), ("medium", 24000), ("heavy", None)])
+def test_agent_memory_level_overrides_env(monkeypatch, level, expected):
+    monkeypatch.setenv("SWARM_CONTEXT_TOKEN_LIMIT", "5000")
+    assert sim.swarm_context_token_limit(level) == expected
+
+
+def test_agent_memory_cli_flag():
+    assert sim.parse_args(["--config", "c.json"]).agent_memory is None
+    assert sim.parse_args(["--config", "c.json", "--agent-memory", "heavy"]).agent_memory == "heavy"
+    with pytest.raises(SystemExit):
+        sim.parse_args(["--config", "c.json", "--agent-memory", "huge"])
+
+
+def test_agent_memory_levels_match_the_backend():
+    from app.services.simulation_runner import SimulationRunner
+    assert set(sim.AGENT_MEMORY_LEVELS) == set(SimulationRunner.AGENT_MEMORY_LEVELS)
+
+
 def test_capped_camel_context_drops_oldest_turns_and_keeps_system_prompt():
     """Guards the private attribute against camel changes: the real context
     creator must truncate against the value cap_agent_context sets."""

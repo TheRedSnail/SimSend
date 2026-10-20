@@ -52,6 +52,7 @@
         <Step3Simulation
           :simulationId="currentSimulationId"
           :maxRounds="maxRounds"
+          :agentMemory="agentMemory"
           :minutesPerRound="minutesPerRound"
           :projectData="projectData"
           :graphData="graphData"
@@ -92,6 +93,8 @@ const viewMode = ref('split')
 const currentSimulationId = ref(route.params.simulationId)
 // Get maxRounds from query params at init time so child components can access it immediately
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
+// Agent memory level chosen in Step2 (light / medium / heavy); the backend validates it
+const agentMemory = ref(route.query.agentMemory || null)
 const minutesPerRound = ref(30) // Default 30 minutes per round
 const projectData = ref(null)
 const graphData = ref(null)

@@ -1185,11 +1185,19 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
 # feed: in a measured run they commented 75% less and searched instead.
 # Capped agents therefore store each message whole, shortened only if it alone
 # would take more than half the cap.
-DEFAULT_SWARM_CONTEXT_TOKENS = 12000
+#
+# Users pick a level per run (--agent-memory). In a measured 168-round run,
+# light cost ~90% less than no cap; agents stayed coherent but forgot more of
+# the early week and repeated themselves more often.
+AGENT_MEMORY_LEVELS = {"light": 12000, "medium": 24000, "heavy": None}
+DEFAULT_SWARM_CONTEXT_TOKENS = AGENT_MEMORY_LEVELS["medium"]
 
 
-def swarm_context_token_limit() -> Optional[int]:
-    """Per-agent context cap from SWARM_CONTEXT_TOKEN_LIMIT (0 = no cap)."""
+def swarm_context_token_limit(agent_memory: Optional[str] = None) -> Optional[int]:
+    """Per-agent context cap (None = no cap): the run's agent memory level if one
+    was picked, else SWARM_CONTEXT_TOKEN_LIMIT (0 = no cap), else medium."""
+    if agent_memory:
+        return AGENT_MEMORY_LEVELS[agent_memory]
     raw = os.environ.get("SWARM_CONTEXT_TOKEN_LIMIT", "").strip()
     if not raw:
         return DEFAULT_SWARM_CONTEXT_TOKENS
@@ -1363,7 +1371,8 @@ async def run_platform_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    agent_memory: Optional[str] = None
 ) -> PlatformSimulation:
     """Run one platform's simulation loop.
 
@@ -1412,12 +1421,13 @@ async def run_platform_simulation(
             )
             platform_type = oasis.DefaultPlatformType.REDDIT
 
-        context_limit = swarm_context_token_limit()
+        context_limit = swarm_context_token_limit(agent_memory)
         capped = cap_agent_context(result.agent_graph, context_limit)
+        memory_label = f"agent memory: {agent_memory}" if agent_memory else "SWARM_CONTEXT_TOKEN_LIMIT/default"
         if context_limit:
-            log_info(f"Agent context capped at {context_limit} tokens ({capped} agents)")
+            log_info(f"Agent context capped at {context_limit} tokens ({capped} agents, {memory_label})")
         else:
-            log_info("Agent context cap disabled (SWARM_CONTEXT_TOKEN_LIMIT=0)")
+            log_info(f"Agent context cap disabled ({memory_label})")
 
         # Real entity names instead of generic Agent_X labels
         agent_names = get_agent_names_from_config(config)
@@ -1595,6 +1605,13 @@ def parse_args(argv=None):
         help='Maximum simulation rounds (optional, for truncating overly long simulations)'
     )
     parser.add_argument(
+        '--agent-memory',
+        choices=sorted(AGENT_MEMORY_LEVELS),
+        default=None,
+        help='How much of its own history each agent keeps: light (12k tokens), medium (24k), '
+             'heavy (no cap). Default: SWARM_CONTEXT_TOKEN_LIMIT, else medium'
+    )
+    parser.add_argument(
         '--no-wait',
         action='store_true',
         default=False,
@@ -1660,7 +1677,8 @@ async def main(argv=None) -> int:
     
     # return_exceptions=True so one platform raising doesn't cancel the sibling.
     raw_results = await asyncio.gather(
-        *(run_platform_simulation(p, config, simulation_dir, platform_loggers[p](), log_manager, args.max_rounds)
+        *(run_platform_simulation(p, config, simulation_dir, platform_loggers[p](), log_manager,
+                                  args.max_rounds, args.agent_memory)
           for p in platforms),
         return_exceptions=True,
     )

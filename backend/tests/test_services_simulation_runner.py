@@ -67,6 +67,14 @@ def test_graph_update_without_graph_id_fails_before_reserving(runner):
     assert not (sim_dir / "run_state.json").exists()
 
 
+def test_unknown_agent_memory_fails_before_reserving(runner):
+    cls, sims = runner
+    sim_id, sim_dir = _make_sim(sims)
+    with pytest.raises(ValueError, match="agent memory"):
+        cls.start_simulation(sim_id, agent_memory="huge")
+    assert not (sim_dir / "run_state.json").exists()
+
+
 def test_spawn_failure_marks_failed_and_allows_retry(runner, monkeypatch):
     cls, sims = runner
     sim_id, sim_dir = _make_sim(sims)
@@ -99,10 +107,10 @@ def test_start_uses_parallel_script_with_platform_flag(runner, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(cls, "_monitor_simulation", classmethod(lambda c, *a, **k: None))
 
-    state = cls.start_simulation(sim_id, platform="reddit", max_rounds=3)
+    state = cls.start_simulation(sim_id, platform="reddit", max_rounds=3, agent_memory="light")
     assert os.path.basename(captured["cmd"][1]) == "run_parallel_simulation.py"
     assert "--reddit-only" in captured["cmd"]
-    assert captured["cmd"][-2:] == ["--max-rounds", "3"]
+    assert captured["cmd"][-4:] == ["--max-rounds", "3", "--agent-memory", "light"]
     assert state.runner_status == RunnerStatus.RUNNING
     assert state.platform == "reddit"
     cls._stdout_files.pop(sim_id).close()

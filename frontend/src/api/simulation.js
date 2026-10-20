@@ -78,7 +78,7 @@ export const listSimulations = (projectId) => {
 
 /**
  * Start simulation
- * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
+ * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update?, agent_memory? }
  */
 export const startSimulation = (data) => {
   return service.post('/api/simulation/start', data)

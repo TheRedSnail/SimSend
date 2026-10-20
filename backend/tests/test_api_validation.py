@@ -21,6 +21,13 @@ def test_start_rejects_bad_max_rounds(client, max_rounds):
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize('agent_memory', ['huge', 'LIGHT', 3, True])
+def test_start_rejects_bad_agent_memory(client, agent_memory):
+    resp = post(client, '/api/simulation/start', {'simulation_id': 'sim_x', 'agent_memory': agent_memory})
+    assert resp.status_code == 400
+    assert 'agent_memory' in resp.get_json()['error']
+
+
 @pytest.mark.parametrize('count', [0, 5000, 'many'])
 def test_prepare_rejects_bad_parallel_profile_count(client, count):
     resp = post(client, '/api/simulation/prepare',

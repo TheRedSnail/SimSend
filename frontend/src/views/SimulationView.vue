@@ -161,10 +161,15 @@ const handleNextStep = (params = {}) => {
     params: { simulationId: currentSimulationId.value }
   }
 
-  // Pass custom rounds via query params if set
+  // Pass custom rounds and agent memory via query params if set
+  const query = {}
   if (params.maxRounds) {
-    routeParams.query = { maxRounds: params.maxRounds }
+    query.maxRounds = params.maxRounds
   }
+  if (params.agentMemory) {
+    query.agentMemory = params.agentMemory
+  }
+  routeParams.query = query
 
   // Navigate to Step 3 page
   router.push(routeParams)
