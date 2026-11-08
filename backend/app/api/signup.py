@@ -1,5 +1,5 @@
 """
-Early-access sign-up API used by the landing page (/welcome).
+Early-access sign-up API used by the landing page (/).
 
 POST /api/signup       public (still needs the X-SimSend-Client header)
 GET  /api/signup/list  admin only: X-Admin-Key must match ADMIN_API_KEY

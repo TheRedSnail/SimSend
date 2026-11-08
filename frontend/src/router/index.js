@@ -10,13 +10,16 @@ import InteractionView from '../views/InteractionView.vue'
 const routes = [
   {
     path: '/',
-    name: 'Home',
-    component: Home
-  },
-  {
-    path: '/welcome',
     name: 'Landing',
     component: Landing
+  },
+  // Earlier landing page addresses, kept working for links already shared.
+  { path: '/welcome', redirect: '/' },
+  { path: '/marketing', redirect: '/' },
+  {
+    path: '/studio',
+    name: 'Home',
+    component: Home
   },
   {
     path: '/process/:projectId',

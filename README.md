@@ -158,9 +158,9 @@ docker compose up -d    # UI + API on http://localhost:5001
 
 The image builds the frontend and serves it from the backend with waitress, runs as a non-root user (uid 1000), and persists `backend/uploads` and `backend/logs`. The port is published on `127.0.0.1` only; set `BIND_ADDRESS=0.0.0.0` to expose it (put it behind a reverse proxy and set `ADMIN_API_KEY`). On Linux, make sure the mounted `backend/uploads` and `backend/logs` directories are writable by uid 1000.
 
-### Landing page and early-access sign-ups
+### Landing page, sign-ups and analytics
 
-`/welcome` is a scroll-driven landing page that walks through a sample run (documents → knowledge graph → conversations → report → follow-up questions) and ends with an early-access form. The app itself stays at `/`.
+`/` is the public landing page: a short, benefit-led page for marketers that ends with an early-access form. The app itself is at `/studio`. (`/welcome` and `/marketing`, earlier landing page addresses, redirect to `/`.)
 
 Sign-ups are saved to `backend/uploads/signups.json`, one record per email address. To read them, set `ADMIN_API_KEY` and call:
 
@@ -169,7 +169,9 @@ curl -H "X-Admin-Key: $ADMIN_API_KEY" http://localhost:5001/api/signup/list     
 curl -H "X-Admin-Key: $ADMIN_API_KEY" "http://localhost:5001/api/signup/list?format=csv"  # CSV
 ```
 
-The sample run on the landing page is illustrative content (`frontend/src/components/landing/story.js`); replace it with a recorded run before relying on it.
+To track the landing page with [Umami](https://umami.is), add a website in your Umami dashboard and set `UMAMI_SCRIPT_URL` and `UMAMI_WEBSITE_ID` in `.env` (a restart is enough, no rebuild). Only the landing page is tracked, never the app: page views plus the events `cta-click` (which button), `signup` and `signup-error`. No names or emails are sent. With either setting empty, nothing is loaded.
+
+The example run on the landing page is illustrative content (`frontend/src/components/landing/content.js`); replace it with a recorded run before relying on it.
 
 ### Tests
 
@@ -180,7 +182,7 @@ npm run lint # frontend ESLint
 
 ## Usage
 
-1. **Open** `http://localhost:3000` (dev) or `http://localhost:5001` (`npm start` / Docker)
+1. **Open** `http://localhost:3000/studio` (dev) or `http://localhost:5001/studio` (`npm start` / Docker)
 2. **Upload** one or more market research documents (PDF, Markdown, TXT)
 3. **Describe** your campaign brief — e.g., *"Simulate consumer reactions to a new eco-friendly packaging launch for our premium skincare line targeting young urban professionals"*
 4. **Click** "Launch Simulation Engine" and follow the 5-step workflow
