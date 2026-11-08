@@ -85,7 +85,7 @@ class Config:
     REPORTS_DIR = os.path.join(UPLOAD_FOLDER, 'reports')
     TASKS_DIR = os.path.join(UPLOAD_FOLDER, 'tasks')
 
-    # Early-access sign-ups from the landing page (/welcome). The list is only
+    # Early-access sign-ups from the landing page (/). The list is only
     # readable through /api/signup/list, which requires ADMIN_API_KEY.
     SIGNUPS_FILE = os.path.join(UPLOAD_FOLDER, 'signups.json')
     MAX_SIGNUPS = int(os.environ.get('SIMSEND_MAX_SIGNUPS', '10000'))
@@ -93,6 +93,11 @@ class Config:
     # IP, so keep this generous.
     SIGNUP_RATE_LIMIT = int(os.environ.get('SIMSEND_SIGNUP_RATE_LIMIT', '20'))
     SIGNUP_RATE_WINDOW_SECONDS = 600
+
+    # Umami analytics for the landing page, served to it by /api/site-config.
+    # Tracking is off unless both are set.
+    UMAMI_SCRIPT_URL = os.environ.get('UMAMI_SCRIPT_URL', '').strip()
+    UMAMI_WEBSITE_ID = os.environ.get('UMAMI_WEBSITE_ID', '').strip()
 
     # Resource limits for client-supplied parameters.
     MAX_CONCURRENT_SIMULATIONS = max(1, int(os.environ.get('SIMSEND_MAX_CONCURRENT_SIMULATIONS', '2')))

@@ -78,8 +78,7 @@
       <p v-if="submitError" class="submit-error" role="alert">{{ submitError }}</p>
 
       <button type="submit" class="submit" :disabled="submitting">
-        <span>{{ submitting ? 'Sending…' : 'Request access' }}</span>
-        <span aria-hidden="true">→</span>
+        {{ submitting ? 'Sending…' : 'Request access' }}
       </button>
       <p class="fineprint">We only use this to contact you about SimSend.</p>
     </form>
@@ -88,6 +87,7 @@
 
 <script setup>
 import { computed, reactive, ref } from 'vue'
+import analytics from '../../analytics'
 import { submitSignup } from '../../api/signup'
 
 const ROLES = [
@@ -148,7 +148,10 @@ const submit = async () => {
     submittedName.value = form.name.trim()
     submittedEmail.value = form.email.trim()
     done.value = true
+    // Only whether they opted into updates: never names or emails.
+    analytics.track('signup', { updates: form.updates })
   } catch (err) {
+    analytics.track('signup-error', { status: err?.status ?? 'network' })
     submitError.value = err?.message && err.message !== 'Request failed'
       ? err.message
       : 'Something went wrong. Please try again.'
@@ -159,11 +162,14 @@ const submit = async () => {
 </script>
 
 <style scoped>
+/* Reads --white, --ink, --orange and --sans from the landing page. */
 .signup-card {
   background: var(--white);
   color: var(--ink);
   padding: clamp(20px, 3vw, 36px);
-  box-shadow: 12px 12px 0 var(--orange);
+  border: 1px solid #DDE2E9;
+  border-radius: 20px;
+  box-shadow: 0 24px 48px -32px rgba(26, 29, 36, 0.4);
 }
 
 form { display: flex; flex-direction: column; gap: 18px; }
@@ -174,15 +180,15 @@ form { display: flex; flex-direction: column; gap: 18px; }
 }
 .field { display: flex; flex-direction: column; gap: 6px; }
 label { font-size: 14px; font-weight: 600; }
-.optional { font-weight: 400; color: #525252; margin-left: 4px; }
+.optional { font-weight: 400; color: #5A606B; margin-left: 4px; }
 
 input[type="text"],
 input[type="email"],
 select,
 textarea {
   min-height: 46px;
-  border: 1px solid #737373;
-  border-radius: 0;
+  border: 1px solid #8A919C;
+  border-radius: 10px;
   padding: 0 12px;
   font-family: var(--sans);
   font-size: 16px;
@@ -220,32 +226,36 @@ input[aria-invalid="true"] { border-color: #B42318; }
   font-size: 14px;
   color: #B42318;
   border: 1px solid #B42318;
+  border-radius: 10px;
   padding: 10px 12px;
 }
 
 .submit {
   min-height: 56px;
-  background: var(--ink);
-  color: var(--white);
+  background: var(--orange);
+  color: var(--ink);
   border: none;
-  font-family: var(--mono);
-  font-weight: 700;
-  font-size: 16px;
-  letter-spacing: 1px;
-  text-transform: uppercase;
+  border-radius: 12px;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 17px;
   display: flex;
-  justify-content: space-between;
+  justify-content: center;
   align-items: center;
   padding: 0 20px;
   cursor: pointer;
   transition: background-color 0.2s;
 }
-.submit:hover:not(:disabled) { background: #262626; }
+.submit:hover:not(:disabled) { background: #FF6A33; }
 .submit:disabled { opacity: 0.6; cursor: progress; }
-.fineprint { font-size: 13px; color: #525252; }
+.fineprint { font-size: 13px; color: #5A606B; }
 
 .thanks { display: flex; flex-direction: column; gap: 14px; padding: 24px 0; }
-.thanks-mark { width: 16px; height: 16px; background: var(--orange); }
+.thanks-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--orange); }
 .thanks h3 { font-size: 32px; font-weight: 600; letter-spacing: -0.02em; }
 .thanks p { font-size: 17px; line-height: 1.6; color: #404040; }
+
+@media (prefers-reduced-motion: reduce) {
+  .submit { transition: none; }
+}
 </style>
